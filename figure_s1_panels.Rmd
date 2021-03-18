@@ -1,0 +1,108 @@
+---
+title: "Figure S1 Panels"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggridges)
+library(pheatmap)
+```
+
+# Load the data
+```{r}
+seurat <- readRDS("../../data/pan_cancer_epi.rds")
+```
+
+```{r}
+dat <- seurat@meta.data
+dat$Group <- paste0(dat$Cancer, " - ", dat$Source)
+dat$SampleFull <- paste0(dat$Cancer, "_", dat$Patient)
+```
+
+# Cell count
+```{r}
+count_dat <- dat %>%
+  group_by(SampleFull) %>%
+  summarise(Count = n())
+count_dat$Group <- dat$Group[match(count_dat$SampleFull, dat$SampleFull)]
+count_dat <- count_dat %>%
+  ungroup() %>%
+  group_by(Group) %>%
+  arrange(desc(Count), .by_group=T)
+count_dat$SampleFull <- factor(count_dat$SampleFull, levels=count_dat$SampleFull)
+```
+
+```{r}
+count_plot <- ggplot(count_dat, aes(x=log10(Count), y=SampleFull)) +
+  geom_point(size=1.9, shape=21, aes(fill=Group), color="black", stroke=1) +
+  ylab("") + xlab("log10(Cell counts)") +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=12, color="black"),
+        axis.text.y=element_text(color="black", size=6),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+# nUMI
+First, a function for stat_summary to use to plot median +/- 25th and 75th quartiles
+```{r}
+median.quartile <- function(x){
+  out <- quantile(x, probs = c(0.25,0.5,0.75))
+  names(out) <- c("ymin","y","ymax")
+  return(out)
+}
+```
+
+
+```{r}
+dat$SampleFull <- factor(dat$SampleFull, levels=levels(count_dat$SampleFull))
+umi_plot <- ggplot(dat, aes(x=log10(nCount_RNA), y=SampleFull)) +
+  stat_summary(fun.data = median.quartile, geom = "pointrange", aes(fill=Group),
+               shape=21, color="black", size=0.45) +
+  ylab("") + xlab("log10(nUMI)") +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=12, color="black"),
+        axis.text.y=element_blank(),
+        #axis.text.y=element_text(color="black", size=6),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+# nFeature
+```{r}
+feature_plot <- ggplot(dat, aes(x=log10(nFeature_RNA), y=SampleFull)) +
+  stat_summary(fun.data = median.quartile, geom = "pointrange", aes(fill=Group),
+               shape=21, color="black", size=0.45) +
+  ylab("") + xlab("log10(Gene count)") +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=12, color="black"),
+        axis.text.y=element_blank(),
+        #axis.text.y=element_text(color="black", size=6),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+# percent mito
+```{r}
+mito_plot <- ggplot(dat, aes(x=percent.mito, y=SampleFull)) +
+  stat_summary(fun.data = median.quartile, geom = "pointrange", aes(fill=Group),
+               shape=21, color="black", size=0.45) +
+  ylab("") + xlab("% mito") +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=12, color="black"),
+        axis.text.y=element_blank(),
+        #axis.text.y=element_text(color="black", size=6),
+        axis.title=element_text(size=12))
+```
+
+# Merge plots
+```{r}
+all_plots <- cowplot::plot_grid(count_plot, umi_plot, feature_plot, mito_plot,
+                                ncol=4, align="h", rel_widths = c(0.7,0.5,0.5,1))
+
+cowplot::save_plot(all_plots, filename="qc_plots.pdf",
+          base_width=12, base_height=15)
+```
+

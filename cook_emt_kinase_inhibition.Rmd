@@ -1,0 +1,663 @@
+---
+title: "EMT Screen - Kinase Inhibition"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(ACTIONet)
+library(SingleCellExperiment)
+library(tidyverse)
+```
+
+# Prep data
+
+```{r}
+a549 <- readRDS("~/Projects/emt_dynamics/data/A549_Kinase_Untreated.rds")
+du145 <- readRDS("~/Projects/emt_dynamics/data/DU145_Kinase_Untreated.rds")
+mcf7 <- readRDS("~/Projects/emt_dynamics/data/MCF7_Kinase_Untreated.rds")
+ovca420 <- readRDS("~/Projects/emt_dynamics/data/OVCA420_Kinase_Untreated.rds")
+```
+
+```{r}
+seurat <- merge(a549, list(du145, mcf7, ovca420))
+```
+
+# Run ACTIONet
+```{r}
+runACTION <- function(sample){
+  print(paste0("Processing sample: ", sample))
+  seurat_subset <- subset(seurat, subset = CellLine == sample & Drug == "Uninhibited_Untreated")
+  sce <- Seurat::as.SingleCellExperiment(seurat_subset, assay="RNA")
+  
+  #Run ACTIONet
+  ace <- reduce.ace(sce, reduced_dim = 25)
+  action <- run.ACTIONet(ace=ace, k_max=6,
+                         min.cells.per.arch = 5) #Tried some tweaks and this works pretty well for me
+  return(action)
+}
+```
+
+```{r}
+cell_lines <- unique(seurat$CellLine)
+action_list <- lapply(cell_lines, runACTION)
+names(action_list) <- cell_lines
+```
+
+```{r}
+saveRDS(action_list, file="../output/ACTIONet_list_cook_emt.rds")
+```
+
+```{r}
+action_list <- readRDS("../output/ACTIONet_list_cook_emt.rds")
+```
+
+# Build master metadata
+
+```{r}
+meta_list <- list()
+for(i in 1:length(action_list)){
+  meta_list[[i]] <- data.frame(Dim1 = action_list[[i]]$ACTIONet2D[,1],
+                               Dim2 = action_list[[i]]$ACTIONet2D[,2],
+                               Archetype_Membership = factor(action_list[[i]]$assigned_archetype))
+  colnames(action_list[[i]]$archetype_footprint) <- paste0("A", 1:ncol(action_list[[i]]$archetype_footprint))
+  meta_list[[i]] <- cbind(meta_list[[i]], action_list[[i]]$archetype_footprint)
+}
+names(meta_list) <- cell_lines
+```
+
+# EMT Gene Set Scoring
+## Load gene sets
+```{r}
+hallmarks <- fgsea::gmtPathways("~/Data/GeneLists/hallmark.genesets.v6.1.symbols.gmt")
+hallmark_emt <- hallmarks["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]
+
+go_terms <- fgsea::gmtPathways("~/Data/GeneLists/GOTerms.BP.v6.1.symbols.gmt")
+go_emt <- go_terms["GO_EPITHELIAL_TO_MESENCHYMAL_TRANSITION"]
+
+#cancerSEA
+cancer_sea <- readRDS("~/Data/GeneLists/cancerSEA/cancerSEA_gene_sets.rds")
+names(cancer_sea) <- paste0("CancerSEA_", names(cancer_sea))
+cancer_sea_emt <- cancer_sea["CancerSEA_EMT"]
+
+#My conserved upregulated list
+conserved_mes <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_upregulated_genes.csv")[-1])
+names(conserved_mes) <- "Conserved_EMT_Up"
+
+#My conserved downregulated list
+conserved_epi <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_downregulated_genes.csv")[-1])
+names(conserved_epi) <- "Conserved_EMT_Down"
+
+#dbEMT
+dbEMT <- read.csv("~/Data/GeneLists/Zhao_dbEMT.csv")
+dbEMT <- list(dbEMT$Symbol)
+names(dbEMT) <- "dbEMT"
+
+#Puram HNSCC pEMT
+puram <- read.csv("~/Data/GeneLists/puram_hnscc_pEMT_signatures.csv")
+puram <- list(unique(puram$Gene)) #All unique genes from their list of 50-gene NMF programs
+names(puram) <- "Puram_pEMT"
+
+#Taube Core EMT Up
+taube_up <- list(read_lines("~/Data/GeneLists/Taube_Core_EMT_Up.txt"))
+names(taube_up) <- "Taube_Core_EMT_Up"
+
+#Kinker et al. EMT signatures
+kinker <- read.csv("~/Data/GeneLists/Kinker_Tirosh_RHPs.csv")
+kinker_1 <- list(Kinker_1 = kinker$EMT.I)
+kinker_2 <- list(Kinker_2 = kinker$EMT.II)
+kinker_3 <- list(Kinker_3 = kinker$EMT.III)
+
+#EMP Signature
+emp_signature <- readLines("../output/conserved_emt_signature.txt")
+```
+
+```{r}
+emt_sets <- c(cancer_sea_emt, hallmark_emt,
+             go_emt,  conserved_mes, dbEMT, puram, taube_up,
+             kinker_1, kinker_2, kinker_3, list(emp_signature))
+```
+
+```{r}
+names(emt_sets)
+```
+
+
+```{r}
+names(emt_sets) <- c("CancerSEA", "Hallmark", "GO", 
+                     "Cook", "dbEMT", "Puram_pEMT", "Taube",
+                     "Kinker_I", "Kinker_II", "Kinker_III", "EMP_Sig")
+```
+
+## Scoring
+We'll just run Seurat's AddModuleScore on each individual sample
+```{r}
+for(i in 1:length(cell_lines)){
+  seurat_subset <- subset(seurat, subset = CellLine == cell_lines[i])
+  seurat_subset <- CellCycleScoring(seurat_subset, s.features = cc.genes.updated.2019$s.genes,
+                                    g2m.features = cc.genes.updated.2019$g2m.genes)
+  # Gene set score each EMT gene set
+  for(n in 1:length(emt_sets)){
+    seurat_subset <- AddModuleScore(seurat_subset, features = emt_sets[n],
+                                    name = names(emt_sets)[n])
+  }
+  
+  colnames(seurat_subset@meta.data)[24:34] <- gsub("1", "", colnames(seurat_subset@meta.data)[24:34]) #remove the stupid 1
+  
+  #Merge data into meta_list
+  # Don't really know why the cell barcode order is different, but they all match *shrug*
+  meta_list[[i]] <- cbind(meta_list[[i]], 
+                        seurat_subset@meta.data[rownames(meta_list[[i]]),c(names(emt_sets),  
+                                                   "S.Score", "G2M.Score", "Phase", 
+                                                   "percent.mito", "nCount_RNA")])
+}
+```
+
+```{r}
+saveRDS(meta_list, file = "../output/master_metadata_cook_kinase.rds")
+```
+
+# Correlate w/ EMT
+```{r}
+getCor <- function(df){
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  cor_mat <- cor(df[,total_arch], df[,names(emt_sets)])
+}
+
+cor_list <- lapply(meta_list, getCor)
+```
+
+```{r}
+gene_set_order <- rev(c("EMP_Sig", "Kinker_III", "dbEMT", "Kinker_I", "Cook", "Hallmark", "Puram_pEMT",
+                    "Taube", "CancerSEA", "Kinker_II", "GO"))
+```
+
+
+```{r}
+heat_list <- NULL
+for(i in 1:length(cell_lines)){
+  heat <- ComplexHeatmap::pheatmap(t(cor_list[[cell_lines[i]]])[gene_set_order,],
+                                   breaks=seq(-0.5,0.5, length.out=100),
+                                   color = colorRampPalette(rev(RColorBrewer::brewer.pal(7, "RdBu")))(100),
+                                  cluster_rows=F,
+                                  cluster_cols=T,
+                                  clustering_method="ward.D2",
+                                  treeheight_col = 0,
+                                  fontsize = 10,
+                                  legend = F,
+                                  border_col="black")
+    heat_list <- heat_list + heat
+}
+draw(heat_list)
+```
+
+```{r}
+pdf(file = "../figs/cook_kinase_figs/CellLine_Archetype_EMT_correlation.pdf",
+    width=5.25, height=2.15)
+draw(heat_list)
+dev.off()
+```
+
+# Get EMT programs
+```{r}
+cor_list_merge <- cor_list
+for(i in 1:length(cor_list_merge)){
+  rownames(cor_list_merge[[i]]) <- paste0(names(cor_list_merge)[i], "_", rownames(cor_list_merge[[i]]))
+}
+cor_list_merge <- do.call("rbind", cor_list_merge)
+```
+
+```{r}
+cols <- paletteer::paletteer_c("scico::berlin", n=100)
+```
+
+```{r}
+emt_cor_heatmap <- pheatmap::pheatmap(cor_list_merge[,gene_set_order],
+                                      color = cols,
+                                      border_col="black",
+                                      breaks=seq(-0.75, 0.75, length.out=101),
+                                      cluster_rows=T,
+                                      cluster_cols=T,
+                                      show_rownames=T,
+                                      cutree_row=4,
+                                      fontsize = 12,
+                                      angle_col=45,
+                                      clustering_method="ward.D2",
+                                     # filename="../figs/cook_kinase_figs/archetype_emt_correlation_all.png",
+                                      width=5, height=7)
+
+plot(emt_cor_heatmap$gtable)
+```
+A549_A3, OVCA420_A4, DU145_A5, MCF7_A2 are best for each line
+
+```{r}
+clusters <- as.data.frame(cutree(emt_cor_heatmap$tree_row, k=4))
+colnames(clusters) <- "Cluster"
+clusters$Program <- rownames(clusters)
+table(clusters$Cluster)
+```
+
+Order from top to bottom
+```{r}
+unique(clusters$Cluster[emt_cor_heatmap$tree_row$order])
+```
+
+```{r}
+emt_programs <- clusters %>% filter(Cluster %in% c(2,3)) %>% pull(Program)
+writeLines(emt_programs, file("../output/cook_emt_programs.txt"))
+```
+
+# PROGENy
+
+```{r}
+for(i in 1:length(cell_lines)){
+  cells_keep <- rownames(meta_list[[cell_lines[i]]])
+  seurat_subset <- subset(seurat, cells = cells_keep)
+  seurat_subset <- SCTransform(seurat_subset, vars.to.regress="percent.mito")
+  progeny_mat <- progeny(as.matrix(seurat_subset[["SCT"]]@scale.data),
+                         top=500)
+  meta_list[[i]] <- cbind(meta_list[[i]], progeny_mat)
+}
+```
+
+```{r}
+saveRDS(meta_list, file="../output/master_metadata_cook_kinase.rds")
+```
+
+## Activity ~ Program
+Because each program has a different
+```{r}
+#pathways <- colnames(progeny_mat)
+pathways <- c("Androgen", "EGFR", "Estrogen", "Hypoxia", "JAK-STAT", "MAPK", "NFkB", "p53", "PI3K", "TGFb", "TNFa", "Trail", "VEGF", "WNT")
+
+testPathway <- function(pathway, program, df){
+  score_norm <- df[,program] / max(df[,program])
+  test_summary <- summary(lm(df[,pathway] ~ score_norm))
+  test_res <- data.frame(Coef = test_summary$coefficients[2,1],
+                         pval = test_summary$coefficients[2,4],
+                         Pathway = pathway)
+  return(test_res)
+}
+
+runPathwayTests <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  df <- meta_list[[sampleID]]
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  
+  pathway_test_res <- list()
+  for(i in 1:length(total_arch)){
+    test_summary <- lapply(pathways, testPathway, program = total_arch[i], df = df)
+    test_summary <- do.call("rbind", test_summary)
+    test_summary$padj <- p.adjust(test_summary$pval, method="BH")
+    test_summary$Program <- paste0(sampleID, "_", total_arch[i])
+    pathway_test_res[[i]] <- test_summary
+  }
+  
+  pathway_test_res <- do.call("rbind", pathway_test_res)
+}
+```
+
+```{r}
+pathway_scores <- lapply(cell_lines, runPathwayTests)
+pathway_scores <- do.call("rbind", pathway_scores)
+```
+
+## Heatmap of coefficients
+```{r}
+pathway_dat <- pathway_scores %>% select(c(Program, Pathway, Coef)) %>%
+  pivot_wider(names_from="Program", values_from="Coef")
+pathway_mat <- as.matrix(pathway_dat[,2:ncol(pathway_dat)])
+rownames(pathway_mat) <- pathway_dat$Pathway
+```
+
+```{r}
+program_list <- list(EMP = emt_programs,
+                     Other = colnames(pathway_mat)[-which(colnames(pathway_mat) %in% emt_programs)])
+
+heat_list <- NULL
+for(i in 1:length(program_list)){
+  heat <- ComplexHeatmap::pheatmap(pathway_mat[,program_list[[i]]],
+                                   breaks=seq(-2,2, length.out=100),
+                                   color = colorRampPalette(brewer.pal(11,"PRGn"))(100),
+                                  cluster_rows=T,
+                                  cluster_cols=T,
+                                  clustering_method="ward.D2",
+                                  treeheight_col = 0,
+                                  fontsize = 10,
+                                  angle_col = "45",
+                                  legend = F,
+                                  border_col="black")
+    heat_list <- heat_list + heat
+}
+draw(heat_list)
+```
+
+```{r}
+pdf(file = "../figs/cook_kinase_figs/Progeny_Coef_Heatmap.pdf",
+    width=6, height=3.5)
+draw(heat_list)
+dev.off()
+```
+
+## PCA of coefficients
+```{r}
+pathway_coef <- pathway_scores
+pathway_coef$padj <- NULL
+pathway_coef$pval <- NULL
+pathway_coef <- pivot_wider(pathway_coef, names_from=Pathway, values_from=Coef)
+pathway_coef <- as.data.frame(pathway_coef)
+rownames(pathway_coef) <- pathway_coef$Program
+pathway_coef$Program <- NULL
+pathway_coef <- as.matrix(pathway_coef)
+rownames(pathway_coef) <- make.names(rownames(pathway_coef))
+```
+
+```{r}
+pca_res <- prcomp(pathway_coef, scale=F)
+```
+
+```{r}
+emt_hits <- factor(rownames(pathway_coef) %in% emt_programs)
+```
+
+
+```{r}
+pca1 <- fviz_pca_biplot(pca_res, geom.ind="point", axes=c(1,2),
+                col.ind = emt_hits, repel=T) +
+  scale_color_manual(values=c('lightgrey', 'firebrick'))
+
+pca2 <- fviz_pca_biplot(pca_res, geom.ind="point", axes=c(2,3),
+                col.ind = emt_hits, repel=T) +
+  scale_color_manual(values=c('lightgrey', 'firebrick'))
+pca1
+pca2
+```
+```{r}
+ggsave(pca1, filename="../figs/cook_kinase_figs/progeny_EMP_pca.pdf",
+       device = cairo_pdf(),
+       width=5, height=3.5)
+```
+
+# Archetype gene differential expression
+## Functions
+```{r}
+##### Generic linear model function on pearson residuals of SCTransform model. Can change to test any other test
+testGene <- function(gene, arch_score, seu){
+  model_res <- summary(lm(seu[["SCT"]]@scale.data[gene,] ~ arch_score))
+  res_table <- data.frame(pval = model_res$coefficients[2,4],
+                          coef = model_res$coefficients[2,1],
+                          Gene = gene)
+  return(res_table)
+}
+
+##### Big function to get gene scores for each program of a given sample
+testPrograms <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  
+  #Subset seurat
+  print("Running SCTransform")
+  seurat_subset <- subset(seurat, subset = CellLine == sampleID &
+                            Drug == "Uninhibited_Untreated")
+  seurat_subset <- SCTransform(seurat_subset, vars.to.regress = "percent.mito")
+  #Get gene residual variance data
+  var_dat <- seurat_subset[["SCT"]]@meta.features
+  var_dat$Gene <- rownames(var_dat)
+  #Select top 2k genes with certain criteria
+  top_genes <- var_dat %>%
+    arrange(desc(sct.residual_variance)) %>%
+    filter(sct.detection_rate >= 0.05) %>% # Require 5% detection rate
+    pull(Gene)
+  top_genes <- top_genes[1:2000] #Top 2k variable genes with those criteria
+  top_genes <- top_genes[which(top_genes %in% rownames(seurat_subset[["SCT"]]@scale.data))]
+  
+  # Get archetype data
+  meta <- meta_list[[sampleID]]
+  arch_list <- unique(paste0("A", meta$Archetype_Membership))
+  
+  # Test genes for each archetype. 
+  print("Testing for genes associated with archetype program activity")
+  result_table <- list()
+  for(i in 1:length(arch_list)){
+    arch_score <- as.numeric(meta[,arch_list[i]])
+    #Normalize archetype scores to have max = 1
+    arch_score <- arch_score / max(arch_score)
+    arch_res <- lapply(top_genes, testGene, arch_score = arch_score, seu = seurat_subset)
+    arch_res <- do.call("rbind", arch_res)
+    arch_res$padj <- p.adjust(arch_res$pval, method="BH")
+    arch_res$Program <- paste0(sampleID, "_", arch_list[i])
+    result_table[[i]] <- arch_res
+  }
+  result_table <- do.call("rbind", result_table)
+}
+```
+
+```{r}
+program_scores <- lapply(cell_lines, testPrograms)
+
+program_scores <- do.call("rbind", program_scores)
+write.csv(program_scores, file="../output/archetype_program_scores_cook_kinase.csv", row.names = F)
+```
+
+```{r}
+program_scores <- read.csv("../output/archetype_program_scores_cook_kinase.csv")
+```
+
+# Organize program scores
+## Coefficient matrix
+For this, I'll keep positive and negative values for the purpose of correlating programs
+
+```{r}
+program_coef <- program_scores
+program_coef$padj <- NULL
+program_coef$pval <- NULL
+program_coef <- pivot_wider(program_coef, names_from=Program, values_from=coef)
+program_coef <- as.data.frame(program_coef)
+rownames(program_coef) <- program_coef$Gene
+program_coef$Gene <- NULL
+program_coef <- as.matrix(program_coef)
+program_coef[is.na(program_coef)] <- 0
+```
+
+# Coefs of genes associated with EMT programs
+
+Goal here: defining a signature of the strongest EMT-associated genes. For this, we only really care to consider the genes with pretty strong coefficients in the model. 
+
+```{r}
+#Get relevant genes
+genes_keep <- program_scores %>%
+  filter(Program %in% emt_programs &
+           padj <= 0.05 &
+           abs(coef) > 1) %>%
+  pull(Gene) %>%
+  unique()
+
+emt_scores <- program_coef[genes_keep, emt_programs]
+
+#emt_scores[emt_scores > 3] <- 3
+#emt_scores[emt_scores < -3] <- -3
+```
+
+```{r}
+emt_pval <- pheatmap::pheatmap(emt_scores,
+                     color = cols,
+                     breaks=seq(-3, 3, length.out=101),
+                     clustering_method="ward.D2",
+                     show_colnames=T,
+                     angle_col = 45,
+                     show_rownames=F,
+                    filename="../figs/cook_kinase_figs/emt_program_coefficients_cook_kinase.png",
+                     width=4.5, height=7)
+```
+
+# Test drugs for inhibition of EMP
+## Define program signatures
+```{r}
+getGenes <- function(program){
+  hits <- program_scores %>% filter(Program == program &
+                                padj <= 0.05 &
+                                coef >= 0.25) %>%
+    pull(Gene)
+}
+
+program_genes <- lapply(unique(program_scores$Program), getGenes)
+names(program_genes) <- unique(program_scores$Program)
+```
+
+```{r}
+emp_genes <- program_genes[emt_programs]
+```
+
+A little wrangling to loop through each EMP program and score those genes in the seurat object
+
+
+```{r}
+annotation_df <- data.frame(ProgramFull = names(emp_genes))
+annotation_df <- separate(annotation_df, ProgramFull,
+                         into = c("CellLine", "Program"),
+                         remove=F)
+annotation_df$GoodName <- make.names(annotation_df$ProgramFull)#deal with stupid numeric cell lines
+```
+
+```{r}
+emp_scores <- list() # will get meta data for each cell line
+for(i in 1:nrow(annotation_df)){
+  seurat_subset <- subset(seurat, subset = CellLine == annotation_df[i,"CellLine"])
+  emp_prog_genes <- emp_genes[[annotation_df[i,"ProgramFull"]]]
+  seurat_subset <- AddModuleScore(seurat_subset, features = list(emp_prog_genes),
+                                  name = annotation_df[i,"GoodName"])
+  #annoying
+  colnames(seurat_subset@meta.data)[24] <- annotation_df[i,"GoodName"] #remove the stupid 1
+  emp_scores[[i]] <- seurat_subset@meta.data
+}
+names(emp_scores) <- annotation_df$ProgramFull
+```
+
+## Plotting scripts
+```{r}
+for(i in 1:nrow(annotation_df)){
+  program_name <- annotation_df[i, "GoodName"]
+  seurat$Drug <- factor(seurat$Drug,
+                                 levels = c("Uninhibited_Untreated",
+                                      unique(seurat$Drug)[-which(unique(seurat$Drug) == "Uninhibited_Untreated")]))
+  dat_plot <- ggplot(emp_scores[[i]], aes_string(x=program_name, y = "Drug")) +
+    geom_density_ridges_gradient(alpha=0.6, scale = 1.5, aes(fill=stat(x)),
+                                 quantile_lines=T, quantiles=2) +
+    scale_fill_viridis_c(name="EMP Sig", option="A") +
+    xlab("EMP Signature") +
+    theme_ridges()
+  
+  ggsave(dat_plot, 
+         filename=paste0("../figs/cook_kinase_figs/archetype_scoring/",
+                         annotation_df[i, "ProgramFull"],
+                         "_EMP.pdf"),
+         width=5.5, height=4.5)
+  
+  ggsave(dat_plot, 
+         filename=paste0("../figs/cook_kinase_figs/archetype_scoring/",
+                         annotation_df[i, "ProgramFull"],
+                         "_EMP.png"),
+         width=5.5, height=4.5)
+}
+```
+
+# Test drug effect on EMP genes
+```{r}
+df_summary <- list()
+for(i in 1:nrow(annotation_df)){
+  dat <- emp_scores[[i]]
+  program <- annotation_df$GoodName[i]
+  
+  # For the sake of this, let's just average out Untreated and DMSO
+  dat$Drug <- as.character(dat$Drug)
+  dat$Drug[dat$Drug == "Uninhibited_Untreated"] <- "Control"
+  dat$Drug <- factor(dat$Drug,
+                     levels = c("Control", 
+                                unique(dat$Drug)[-which(unique(dat$Drug) == "Control")]))
+  
+  
+  model_res <- summary(lm(dat[,program] ~ dat$Drug))
+  model_res <- as.data.frame(coefficients(model_res))
+  model_res <- model_res[2:nrow(model_res),c(1,4)]
+  model_res$Drug <- substr(rownames(model_res), 9, nchar(rownames(model_res)))
+  model_res$Program <- program
+  
+  df_summary[[i]] <- model_res
+}
+
+df_summary <- do.call("rbind", df_summary)
+rownames(df_summary) <- 1:nrow(df_summary)
+df_summary$padj <- p.adjust(df_summary$`Pr(>|t|)`, method="BH")
+write.csv(df_summary, file="../output/cook_kinase_emp_drug_sensitivity.csv")
+```
+
+```{r}
+#summary_mat <- df_summary %>% filter(padj <= 0.05) #Include all to distinguish between not tested and not significant
+summary_mat <- df_summary[,c("Drug", "Program", "Estimate")]
+```
+
+```{r}
+summary_mat <- pivot_wider(summary_mat, names_from = Program, values_from = Estimate)
+```
+
+```{r}
+drug_names <- summary_mat$Drug
+summary_mat <- as.matrix(summary_mat[,2:ncol(summary_mat)])
+rownames(summary_mat) <- drug_names
+```
+
+## Dotplot
+We'll steal the order from a heatmap though :P
+```{r}
+drug_heat <- pheatmap::pheatmap(summary_mat,
+         color = colorRampPalette(RColorBrewer::brewer.pal(9, "PRGn"))(100),
+         breaks = seq(-0.25, 0.25, length.out=101),
+         na_col = "grey80",
+         border_color = "black",
+         clustering_method="ward.D2",
+         angle_col = 45,
+         fontsize_col = 7)
+```
+
+```{r}
+drug_levels <- rownames(summary_mat)[drug_heat$tree_row$order]
+program_levels <- colnames(summary_mat)[drug_heat$tree_col$order]
+
+df_summary$Drug <- factor(df_summary$Drug, levels=drug_levels)
+df_summary$Program <- factor(df_summary$Program, levels = program_levels)
+
+df_summary$log_qval <- -log10(df_summary$padj)
+df_summary$log_qval[df_summary$log_qval > 10] <- 10 #hate these hacks to limit ggplot2 scales
+df_summary$Estimate[df_summary$Estimate > 0.2] <- 0.2
+df_summary$Estimate[df_summary$Estimate < -0.2] <- -0.2
+```
+
+
+```{r}
+drug_dot <- ggplot(df_summary, aes(x=Program, y=Drug)) +
+  geom_point(aes(size = log_qval, fill = Estimate), color="black", shape=21) +
+  scale_size("-log10(padj)", range = c(0,5)) +
+  scale_fill_gradientn(colours = colorRampPalette(RColorBrewer::brewer.pal(9, "PRGn"))(100),
+                       limits = c(-0.2, 0.2),
+                       guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black"),
+                       name = "Effect size") +
+  ylab("") + xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size=8, angle=45, hjust=1, color="black"),
+        axis.text.y = element_text(size=12, color="black"))
+
+ggsave(drug_dot, filename="../figs/cook_kinase_figs/emt_program_coefficients_cookdotplot.pdf",
+       device = cairo_pdf(),
+       width=6, height=6)
+ggsave(drug_dot, filename="../figs/cook_kinase_figs/emt_program_coefficients_cook_dotplot.png",
+       width=6, height=6)
+```
+
+
+
+
+
+
+

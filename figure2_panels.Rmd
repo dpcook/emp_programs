@@ -1,0 +1,350 @@
+---
+title: "Fig2 Panels"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggrastr)
+options(ggrastr.default.dpi=600)
+library(GeneOverlap)
+library(ggrepel)
+library(cowplot)
+```
+
+# Load common data
+```{r}
+seurat <- readRDS("../../data/pan_cancer_epi.rds")
+meta_list <- readRDS("../../output/master_metadata.rds")
+program_scores <- read.csv("../../output/archetype_program_scores.csv")
+emt_programs <- readLines("../../output/emp_program_list.txt")
+```
+
+# Fig 2A - Model coefficients
+
+```{r}
+program_coef <- program_scores
+program_coef$padj <- NULL
+program_coef$pval <- NULL
+program_coef <- pivot_wider(program_coef, names_from=Program, values_from=coef)
+program_coef <- as.data.frame(program_coef)
+rownames(program_coef) <- program_coef$Gene
+program_coef$Gene <- NULL
+program_coef <- as.matrix(program_coef)
+program_coef[is.na(program_coef)] <- 0
+```
+
+```{r}
+#Get relevant genes
+genes_keep <- program_scores %>%
+  filter(Program %in% emt_programs &
+           padj <= 0.05 &
+           abs(coef) > 2) %>%
+  pull(Gene) %>%
+  unique()
+
+emt_scores <- program_coef[genes_keep, emt_programs]
+
+emt_scores[emt_scores > 3] <- 3
+emt_scores[emt_scores < -3] <- -3
+```
+
+Make an annotation bar to color by cancer (matching UMAP colors)
+```{r}
+annotation_col <- data.frame(Program = emt_programs)
+annotation_col <- separate(annotation_col, Program, sep="_",
+                           into=c("Cancer", "Extra"),
+                           remove=F)
+annotation_col <- annotation_col[,c("Program", "Cancer")]
+rownames(annotation_col) <- annotation_col$Program
+annotation_col$Program <- NULL 
+
+# Set colors
+annotation_color <- list(
+  Cancer = c(Breast = "#ebac23",
+             Colorectal = "#b80058",
+             Gastric = "#008cf9",
+             Lung = "#006e00",
+             Ovarian = "#00bbad",
+             PDAC = "#d163e6",
+             SCC = "#b24502",
+             `Uveal Melanoma` = "#ff9287"))
+```
+
+
+```{r}
+cols <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(100)
+emt_pval <- pheatmap::pheatmap(emt_scores,
+                     color = cols,
+                     breaks=seq(-1.5, 1.5, length.out=101),
+                     clustering_method="ward.D2",
+                     treeheight_col=0,
+                     treeheight_row=0,
+                     show_colnames=F,
+                     show_rownames=F,
+                     annotation_col = annotation_col,
+                     annotation_colors = annotation_color,
+                     annotation_legend = F,
+                     legend=F,
+                     cutree_rows=3,
+                     filename="emt_program_coefficients.png",
+                     width=3, height=3, dpi=300)
+```
+
+```{r}
+emt_clusters <- as.data.frame(cutree(emt_pval$tree_row, k=3))
+colnames(emt_clusters) <- "Cluster"
+emt_clusters$Gene <- rownames(emt_clusters)
+table(emt_clusters$Cluster)
+```
+
+Order from top to bottom
+```{r}
+unique(emt_clusters$Cluster[emt_pval$tree_row$order])
+```
+
+```{r}
+emt_sig <- emt_clusters %>% filter(Cluster==2) %>% pull(Gene)
+```
+
+# Fig 2B - Gene counts
+
+```{r}
+gene_counts_up <- program_scores %>%
+  filter(Program %in% emt_arch_high & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef > 2) %>%
+  group_by(Gene) %>%
+  summarise(Count_Up = length(Program)) %>%
+  arrange(desc(Count_Up))
+
+
+gene_counts_down<- program_scores %>%
+  filter(Program %in% emt_arch_high  & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef < -2) %>%
+  group_by(Gene) %>%
+  summarise(Count_Down = length(Program)) %>%
+  arrange(desc(Count_Down))
+
+gene_counts <- left_join(gene_counts_up, gene_counts_down,
+                         by="Gene")
+gene_counts$Count_Down[is.na(gene_counts$Count_Down)] <- 0
+```
+
+```{r}
+labels <- c("ITGA1", "ITGB1", "ITGA4", "KRT19", "CEACAM6", "CD55", "JUN",
+            "KLF6", "SOX4", "MMP7", "IL32", "VEGFA",
+            "COL17A1", "ITGB1", "NFKBIA")
+```
+
+
+```{r}
+gene_counts$Label <- ""
+gene_counts$Label[which(gene_counts$Gene %in% labels)] <- gene_counts$Gene[which(gene_counts$Gene %in% labels)]
+gene_counts <- filter(gene_counts, Gene %in% emt_sig) # Only plot those that have already passed EMT sig
+
+gene_freq_plot <- ggplot(gene_counts, aes(Count_Up, Count_Down, label=Label)) +
+  geom_point(size=0.5, color="black", alpha=0.5, shape=16) +
+  geom_text_repel(colour="firebrick",
+                  max.overlaps = Inf,
+                  min.segment.length=0.2,
+                  direction="both",
+                  nudge_y=3,
+                  force=10,
+                  size=2.5,
+                  hjust=0.5,
+                  segment.size=0.25,
+                  segment.color="firebrick") +
+  geom_hline(yintercept = 10, linetype=2, color="black") +
+  geom_vline(xintercept = 10, linetype=2, color="black") +
+  xlab("EMP Upregulated") + ylab("EMP Downregulated") +
+  theme_classic() +
+  theme(axis.text = element_text(size=10, color="black"),
+        axis.title = element_text(size=12))
+
+ggsave(gene_freq_plot, filename="emp_gene_counts.pdf",
+       width=2.7, height=3.2, device=cairo_pdf())
+```
+
+Refine EMT sig to be only genes implicated in >=10 programs
+```{r}
+emt_sig <- gene_counts %>%
+  filter(Count_Up >=10 & Count_Down <= 10) %>%
+  pull(Gene)
+```
+
+
+# Fig 2C - GO Terms
+```{r}
+go <- fgsea::gmtPathways("~/Data/GeneLists/GOTerms.BP.v6.1.symbols.gmt")
+```
+
+```{r}
+enrichmentTest <- function(gene_set){
+  go_object <- newGeneOverlap(emt_sig, gene_set,
+                              spec = "hg19.gene")
+  go_object <- testGeneOverlap(go_object)
+  results <- go_object@pval
+}
+
+enrichment <- lapply(go, enrichmentTest)
+enrichment <- as.data.frame(do.call("rbind", enrichment))
+colnames(enrichment) <- "pval"
+enrichment$padj <- p.adjust(enrichment$pval, method = "BH")
+```
+
+```{r}
+table(enrichment$padj <= 0.05)
+```
+
+```{r}
+enrichment$Term <- rownames(enrichment)
+```
+
+```{r}
+enrichment$Term <- gsub("GO_", "", enrichment$Term)
+enrichment$Term <- gsub("_", " ", enrichment$Term)
+enrichment$Term <- Hmisc::capitalize(tolower(enrichment$Term))
+```
+
+```{r}
+enrichment %>% arrange(padj) %>% head(300)
+```
+
+```{r}
+plot_terms <- c("Regulation of cell death", "Regulation of cell proliferation",
+                "Epithelium development", "Regulation of cellular component movement",
+                "Regulation of cell adhesion", "Immune system process", "Cell motility",
+                "Response to wounding", "Vasculature development")
+plot_dat <- filter(enrichment, Term %in% plot_terms) %>% arrange(padj)
+plot_dat$Term <- factor(plot_dat$Term, levels=plot_dat$Term)
+
+enrichment_plot <- ggplot(plot_dat, aes(x=-log10(padj), y=Term)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", aes(fill=-log10(padj))) +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  scale_fill_gradientn(colours=viridis::inferno(100), limits=c(0,max(-log10(plot_dat$padj)))) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(-log10(plot_dat$padj)+1))) +
+  xlab("-log10(p-value)") + ylab("") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+```{r}
+ggsave(enrichment_plot, device=cairo_pdf(),
+       filename="emt_sig_go.pdf",
+       width=6, height=3)
+```
+
+# Fig 2D - Sample Genes
+## Coef hist
+
+```{r}
+getHistogram <- function(gene){
+  dat <- data.frame(Coef = program_coef[gene,emt_programs],
+                  Program = emt_programs)
+  coef_hist <- ggplot(dat, aes(x=Coef)) +
+    geom_histogram(fill="lightgrey", color="black", alpha=0.5, bins = 20) +
+    geom_vline(xintercept=mean(dat$Coef), linetype=2, ) +
+    ggtitle(gene) +
+    xlab("EMP Model Coefficient") + ylab("Count") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=14, color="black", face="italic"),
+          legend.position="none")
+  return(coef_hist)
+}
+
+mmp7 <- getHistogram("MMP7")
+itgb4 <- getHistogram("ITGB4")
+klf6 <- getHistogram("KLF6")
+krt19 <- getHistogram("KRT19")
+```
+
+## Exp plot
+```{r}
+getExpPlot <- function(gene){
+  program <- program_scores %>%
+    filter(Program %in% emt_programs &
+             Gene == gene)
+  program <- program$Program[which(program$coef == max(program$coef))]
+
+    
+  sampleID <- substr(program, 1, nchar(program)-3)
+  arch <- substr(program, nchar(program)-1, nchar(program))
+  
+  meta <- meta_list[[sampleID]]
+  meta[,gene] <- seurat[["RNA"]]@data[gene, rownames(meta)]
+  meta[,arch] <- meta[,arch] / max(meta[,arch])
+  
+  print(paste0(gene, ": ", sampleID))
+  
+  exp_plot <- ggplot(meta, aes_string(arch, gene)) +
+    geom_point(size=0.1, colour="firebrick", alpha=0.5) +
+    geom_smooth(color="black") +
+    ggtitle(gsub("_", " - ", sampleID)) +
+    scale_x_continuous(breaks=c(0,0.5,1)) +
+    ylab("log(TP10k+1)") + xlab("EMP Program") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=10))
+  exp_plot
+}
+
+mmp7_exp <- getExpPlot("MMP7")
+itgb4_exp <- getExpPlot("ITGB4")
+klf6_exp <- getExpPlot("KLF6")
+krt19_exp<- getExpPlot("KRT19")
+```
+
+```{r}
+full_plot <- plot_grid(mmp7, itgb4, klf6, krt19,
+                       mmp7_exp, itgb4_exp, klf6_exp, krt19_exp,
+                       ncol=4, align="hv")
+```
+
+```{r}
+save_plot(full_plot,
+          filename="sample_genes.pdf",
+          base_height=4.5, base_width=10)
+```
+
+# Fig 2E - Pan-cancer UMAP
+
+```{r}
+dat <- seurat@meta.data
+dat$UMAP1 <- Embeddings(seurat, 'umap')[,1]
+dat$UMAP2 <- Embeddings(seurat, 'umap')[,2]
+dat$EMT_Sig[dat$EMT_Sig<0] <- 0
+dat$EMT_Sig[dat$EMT_Sig > 1] <- 1
+```
+
+```{r}
+sig_plot <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point_rast(size=0.01, shape=16, alpha=0.75, aes(color=EMT_Sig)) +
+  scale_colour_gradientn(colours=viridis::inferno(100)) +
+  theme_void() +
+  theme(legend.position="none") #will do manual. Values range 0-1.25
+sig_plot
+```
+```{r}
+ggsave(sig_plot, filename="pan_cancer_emt_sig_umap.pdf", 
+       width=4, height=3.25)
+```
+
+
+
+
+
+
+
+
+
+
+
+

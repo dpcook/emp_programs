@@ -1,0 +1,735 @@
+---
+title: "Pan cancer EMT program"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ACTIONet)
+library(pheatmap)
+library(ComplexHeatmap)
+```
+
+# Load the data
+Objects generated in actionet_pan_cancer.Rmd
+
+```{r}
+seurat <- readRDS("../data/pan_cancer_epi.rds")
+sample_list <- unique(seurat$SampleID)
+meta_list <- readRDS("~/Projects/emt_programs/output/master_metadata.rds")
+```
+
+# Archetype-associated genes
+I had originally used the specificity scores computed by ACTIONet, but I'm feeling less comfortable because I really don't know how they're calculated. To get a little bit more control, the plan is to go archetype by archetype, running a linear model on the SCT pearson residuals of the top 2k genes to find genes significantly associated with the archetype footprint scores. Then I can use both p-values and the coefficients to narrow in on things.
+
+I want to keep mitochondrial genes out of the analysis for convenience
+```{r}
+mtGenes <- grep('^MT-',rownames(seurat),value=TRUE)
+```
+
+# Functions
+```{r}
+##### Generic linear model function on pearson residuals of SCTransform model. Can change to test any other test
+testGene <- function(gene, arch_score, mito, seu){
+  model_res <- summary(lm(seu[["SCT"]]@scale.data[gene,] ~ arch_score + mito))
+  res_table <- data.frame(pval = model_res$coefficients[2,4],
+                          coef = model_res$coefficients[2,1],
+                          Gene = gene)
+  return(res_table)
+}
+
+##### Big function to get gene scores for each program of a given sample
+testPrograms <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  
+  #Subset seurat
+  print("Running SCTransform")
+  seurat_subset <- subset(seurat, subset = SampleID == sampleID)
+  seurat_subset <- SCTransform(seurat_subset, vars.to.regress="percent.mito")
+  var_dat <- sctransform::vst(seurat_subset[["RNA"]]@counts)
+  #Get gene residual variance data
+  var_dat <- var_dat$gene_attr
+  var_dat$Gene <- rownames(var_dat)
+  #Select top 2k genes with certain criteria
+  top_genes <- var_dat %>%
+    arrange(desc(residual_variance)) %>%
+    filter(detection_rate >= 0.05) %>% # Require 5% detection rate
+    pull(Gene)
+  top_genes <- top_genes[1:2000] #Top 2k variable genes with those criteria
+  top_genes <- top_genes[which(top_genes %in% VariableFeatures(seurat_subset))]
+  
+  # Get archetype data
+  meta <- meta_list[[sampleID]]
+  arch_list <- unique(paste0("A", meta$Archetype_Membership))
+  
+  # Test genes for each archetype. 
+  print("Testing for genes associated with archetype program activity")
+  result_table <- list()
+  for(i in 1:length(arch_list)){
+    arch_score <- as.numeric(meta[,arch_list[i]])
+    mito <- as.numeric(meta$percent.mito)
+    #Normalize archetype scores to have max = 1
+    arch_score <- arch_score / max(arch_score)
+    arch_res <- lapply(top_genes, testGene, 
+                       arch_score = arch_score,
+                       mito = mito, 
+                       seu = seurat_subset)
+    arch_res <- do.call("rbind", arch_res)
+    arch_res$padj <- p.adjust(arch_res$pval, method="BH")
+    arch_res$Program <- paste0(sampleID, "_", arch_list[i])
+    result_table[[i]] <- arch_res
+  }
+  result_table <- do.call("rbind", result_table)
+}
+```
+
+```{r}
+program_scores <- lapply(sample_list, testPrograms)
+
+program_scores <- do.call("rbind", program_scores)
+write.csv(program_scores, file="../output/archetype_program_scores.csv", row.names = F)
+```
+
+```{r}
+program_scores <- read.csv("../output/archetype_program_scores.csv")
+```
+
+
+# Organize program scores
+## -log10(padj) mat
+For this matrix, I think I'll only keep significant changes w/ positive coefficients so that we don't get genes with hits in multiple programs without knowing that they're going in opposite directions.
+
+```{r}
+program_pval <- program_scores
+program_pval <- filter(program_pval, coef > 0 & padj <= 0.05) # torn about doing only sig--should help
+program_pval$coef <- NULL
+program_pval$pval <- NULL
+program_pval$padj <- -log10(program_pval$padj)
+program_pval <- pivot_wider(program_pval, names_from=Program, values_from=padj)
+program_pval <- as.data.frame(program_pval)
+rownames(program_pval) <- program_pval$Gene
+program_pval$Gene <- NULL
+program_pval <- as.matrix(program_pval)
+program_pval[is.na(program_pval)] <- 0
+```
+
+## Coefficient matrix
+For this, I'll keep positive and negative values for the purpose of correlating programs
+
+```{r}
+program_coef <- program_scores
+program_coef$padj <- NULL
+program_coef$pval <- NULL
+program_coef <- pivot_wider(program_coef, names_from=Program, values_from=coef)
+program_coef <- as.data.frame(program_coef)
+rownames(program_coef) <- program_coef$Gene
+program_coef$Gene <- NULL
+program_coef <- as.matrix(program_coef)
+program_coef[is.na(program_coef)] <- 0
+```
+
+## List of program-associated genes
+```{r}
+assessSig <- function(program){
+  hits <- program_scores %>%
+    filter(Program == program) %>%
+    filter(padj <= 0.05 & coef > 0) %>%
+    arrange(desc(padj)) %>% #Just so genes are actually ranked by significance in the list
+    pull(Gene)#can add coefficient cutoffs if desired
+  return(hits)
+}
+
+program_genes <- lapply(colnames(program_pval), assessSig)
+names(program_genes) <- colnames(program_pval)
+```
+
+# Program size (sig count)
+```{r}
+program_size <- program_scores %>%
+  filter(padj <= 0.05 & coef > 0.5) %>%
+  group_by(Program) %>%
+  summarise(Size = length(Gene))
+```
+
+```{r}
+hist(program_size$Size, breaks=100)
+```
+
+
+
+# Gene counts
+```{r}
+gene_counts <- program_scores %>%
+  filter(padj <= 0.05 & coef > 0.5) %>%
+  group_by(Gene) %>%
+  summarise(Count = length(Program)) %>%
+  arrange(desc(Count))
+
+gene_counts
+```
+
+
+# Correlate programs
+I could just take programs_coef and correlate, but I feel like this would diminish some of the signal given that the matrix has ~15k genes and only ~2k are tested per program. The many 0,0s could mess with it. I think I could try two options:
+1) Only correlate on genes tested for the pairwise conditions (max 4k genes)
+2) Only correlate on genes significant in at least one of the two conditions
+
+
+```{r}
+program_list <- unique(program_scores$Program)
+```
+
+
+## 1) Only tested genes
+It's really slow because I have to calculate all pairwise separately and can't just feed a full matrix
+I think it's the dplyr function that adds up here
+```{r}
+corTest <- function(program1, program2){
+  genes_test <- filter(program_scores, Program %in% c(program1, program2)) %>%
+    pull(Gene) %>%
+    unique()
+  dat_mat <- program_coef[genes_test, c(program1, program2)]
+  program_cor <- cor(dat_mat[,program1], dat_mat[,program2], method="spearman")
+  return(program_cor)
+}
+
+testCorrelation <- function(program){
+  cor_vals <- lapply(program_list, corTest, program2 = program)
+  cor_vals <- do.call("rbind", cor_vals)
+  rownames(cor_vals) <- program_list
+  return(cor_vals)
+}
+
+cor_mat <- lapply(program_list, testCorrelation)
+cor_mat <- do.call("cbind", cor_mat)
+colnames(cor_mat) <- program_list
+
+
+write.csv(cor_mat, file="../output/program_coef_correlation.csv")
+```
+
+```{r}
+cols <- paletteer::paletteer_c("scico::berlin", n=100)
+pheatmap(cor_mat,
+         color = cols,
+         breaks = seq(-0.5, 0.5, length.out=101),
+         clustering_method="ward.D2",
+         show_colnames = F,
+         show_rownames = F,
+         filename="../figs/archetype_program_correlation.png",
+         width=8, height=8) 
+```
+
+
+## Jaccard
+```{r}
+getJaccard <- function(program){
+  jaccard_scores <- 0
+  for(i in 1:length(program_genes)){
+    jaccard_scores[i] <- length(intersect(program_genes[[program]], program_genes[[i]])) / length(union(program_genes[[program]], program_genes[[i]]))
+  }
+  names(jaccard_scores) <- names(program_genes)
+  return(jaccard_scores)
+}
+```
+
+```{r}
+jaccard <- lapply(names(program_genes), getJaccard)
+jaccard <- do.call(rbind, jaccard)
+rownames(jaccard) <- colnames(jaccard)
+```
+
+```{r}
+pheatmap::pheatmap(jaccard,
+         color = viridis::inferno(100),
+         border_color = "black",
+         breaks = seq(0, 0.50, length.out=101),
+         clustering_method="ward.D2",
+         show_colnames = T,
+         show_rownames = F,
+         angle_col = 45,
+         fontsize_col = 4,
+         filename="../figs/archetype_program_jaccard_emp_programs.png",
+         width=12, height=12) 
+```
+
+# Get EMT programs
+```{r}
+cor_list_merge <- read.csv("../output/archetype_emt_correlation.csv", row.names=1)
+cor_list_merge <- as.matrix(cor_list_merge)
+```
+
+```{r}
+#cols <- paletteer::paletteer_c("scico::berlin", n=100)
+cols <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(100)
+```
+
+```{r}
+gene_set_order <- c("Cook", "Puram_pEMT", "Kinker_III", "dbEMT", "Kinker_I",
+                    "GO", "CancerSEA", "Taube", "Hallmark", "Kinker_II")
+```
+
+```{r}
+emt_cor_heatmap <- pheatmap::pheatmap(cor_list_merge[,gene_set_order],
+                                      color = cols,
+                                      breaks=seq(-0.75, 0.75, length.out=101),
+                                      cluster_rows=T,
+                                      cluster_cols=F,
+                                      show_rownames=F,
+                                      cutree_row=3,
+                                      fontsize = 12,
+                                      angle_col=45,
+                                      clustering_method="ward.D2",
+                                      #filename="../figs/archetype_emt_correlation_all.png",
+                                      width=3.5, height=8)
+
+plot(emt_cor_heatmap$gtable)
+```
+```{r}
+clusters <- as.data.frame(cutree(emt_cor_heatmap$tree_row, k=2))
+colnames(clusters) <- "Cluster"
+clusters$Program <- rownames(clusters)
+table(clusters$Cluster)
+```
+
+Order from top to bottom
+```{r}
+unique(clusters$Cluster[emt_cor_heatmap$tree_row$order])
+```
+
+```{r}
+emt_arch_high <- clusters %>% filter(Cluster==1) %>% pull(Program)
+```
+
+```{r}
+writeLines(emt_arch_high, file("../output/emp_program_list.txt"))
+```
+
+
+# Coefs of genes associated with EMT programs
+
+Goal here: defining a signature of the strongest EMT-associated genes. For this, we only really care to consider the genes with pretty strong coefficients in the model. 
+
+```{r}
+#Get relevant genes
+genes_keep <- program_scores %>%
+  filter(Program %in% emt_arch_high &
+           padj <= 0.05 &
+           abs(coef) > 2) %>%
+  pull(Gene) %>%
+  unique()
+
+emt_scores <- program_coef[genes_keep, emt_arch_high]
+
+emt_scores[emt_scores > 3] <- 3
+emt_scores[emt_scores < -3] <- -3
+```
+
+```{r}
+cols <- colorRampPalette(rev(RColorBrewer::brewer.pal(9, "RdBu")))(100)
+emt_pval <- pheatmap::pheatmap(emt_scores,
+                     color = cols,
+                     breaks=seq(-3, 3, length.out=101),
+                     clustering_method="ward.D2",
+                     show_colnames=T,
+                     angle_col = 45,
+                     fontsize = 2.5,
+                     show_rownames=F,
+                     cutree_rows=3,
+                     #cutree_cols = 4,
+                     #filename="../figs/emt_program_coefficients.png",
+                     width=15, height=10)
+```
+
+```{r}
+emt_clusters <- as.data.frame(cutree(emt_pval$tree_row, k=3))
+colnames(emt_clusters) <- "Cluster"
+emt_clusters$Gene <- rownames(emt_clusters)
+table(emt_clusters$Cluster)
+```
+
+Order from top to bottom
+```{r}
+unique(emt_clusters$Cluster[emt_pval$tree_row$order])
+```
+
+```{r}
+emt_sig <- emt_clusters %>% filter(Cluster==2) %>% pull(Gene)
+writeLines(emt_sig, file("../output/conserved_emt_signature.txt"))
+emt_sig
+```
+
+This coefficient approach is probably the best for designing a signature (especially if goal is to use as a scRNA-seq signature). Will contain the genes with strongest signal-to-noise, but doesn't necessarily mean that these are the only genes involved. Eg. Lowering coefficient threshold allows some TFs to be significant more often. Plus, a 233 gene set is a good number for scoring.
+
+Interesting to see that MHC class I genes are consistently there. Actually, I thought MHC-I genes are often downregulated. Hm.
+
+And downregulated genes:
+```{r}
+emt_down_sig <- emt_clusters %>% filter(Cluster==3) %>% pull(Gene)
+writeLines(emt_down_sig, file("../output/conserved_emt_down_sig.txt"))
+emt_down_sig
+```
+
+I think this is largely related to proliferation. Maybe protein synthesis too (which I guess is also associated with proliferation)
+
+# Refine With Count
+The idea here is that some of these genes go down in a high proportion of programs, or only go up in a small number. Can we refine the signature by selecting those that go up in a reasonable number of programs and do not go down in many
+
+```{r}
+gene_counts_up <- program_scores %>%
+  filter(Program %in% emt_arch_high & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef > 2) %>%
+  group_by(Gene) %>%
+  summarise(Count_Up = length(Program)) %>%
+  arrange(desc(Count_Up))
+
+
+gene_counts_down<- program_scores %>%
+  filter(Program %in% emt_arch_high  & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef < -2) %>%
+  group_by(Gene) %>%
+  summarise(Count_Down = length(Program)) %>%
+  arrange(desc(Count_Down))
+
+gene_counts <- left_join(gene_counts_up, gene_counts_down,
+                         by="Gene")
+gene_counts$Count_Down[is.na(gene_counts$Count_Down)] <- 0
+```
+
+
+```{r}
+ggplot(gene_counts, aes(Count_Up, Count_Down)) +
+  geom_point(alpha=0.5) +
+  geom_hline(yintercept = 10, linetype=2) +
+  geom_vline(xintercept = 10, linetype=2) +
+  theme_classic()
+```
+
+
+```{r}
+labels <- c("ITGA1", "ITGB1", "ITGA4", "KRT19", "CEACAM6", "CD55", "JUN",
+            "KLF6", "SOX4", "MMP7", "IL32", "VEGFA",
+            "COL17A1", "ITGB1", "NFKBIA")
+```
+
+```{r}
+gene_counts$Label <- ""
+gene_counts$Label[which(gene_counts$Gene %in% labels)] <- gene_counts$Gene[which(gene_counts$Gene %in% labels)]
+gene_counts <- filter(gene_counts, Gene %in% emt_sig) # Only plot those that have already passed EMT sig
+
+ligand_freq_plot <- ggplot(gene_counts, aes(Count_Up, Count_Down, label=Label)) +
+  geom_point(size=1, color="black") +
+  geom_text_repel(colour="firebrick",
+                  max.overlaps = Inf,
+                  min.segment.length=0.2,
+                  direction="both",
+                  nudge_y=4,
+                  force=8,
+                  size=3.5,
+                  hjust=0.5,
+                  segment.size=0.5,
+                  segment.color="firebrick") +
+  geom_hline(yintercept = 10, linetype=2, color="black") +
+  geom_vline(xintercept = 10, linetype=2, color="black") +
+  xlab("EMP Upregulated") + ylab("EMP Downregulated") +
+  #scale_y_continuous(breaks=c(0,20, 40, 60, 80), limits=c(0,88)) +
+  theme_classic() +
+  theme(axis.text = element_text(size=10, color="black"),
+        axis.title = element_text(size=12))
+
+ggsave(ligand_freq_plot, filename="../figs/emp_gene_counts.pdf",
+       width=2.7, height=3.2, device=cairo_pdf())
+```
+
+```{r}
+ligand_freq_plot
+```
+
+#Refine EMT signature
+```{r}
+emt_sig <- gene_counts %>%
+  filter(Count_Up >= 10, Count_Down <= 10) %>%
+  pull(Gene)
+
+writeLines(emt_sig, file("../output/conserved_emt_signature.txt"))
+```
+
+
+# Total genes per sample
+```{r}
+assessSig <- function(program){
+  hits <- program_scores %>%
+    filter(Program == program) %>%
+    filter(padj <= 0.05 & coef > 1) %>%
+    arrange(desc(padj)) %>% #Just so genes are actually ranked by significance in the list
+    pull(Gene)#can add coefficient cutoffs if desired
+  return(hits)
+}
+
+program_list <- unique(program_scores$Program)
+program_genes <- lapply(program_list, assessSig)
+names(program_genes) <- program_list
+```
+
+```{r}
+emt_program_names <- readLines("~/Projects/emt_programs/output/emp_program_list.txt")
+emt_program <- program_genes[emt_program_names]
+```
+
+```{r}
+dat <- unlist(lapply(emt_program, length))
+dat <- data.frame(Program = names(dat), Count = dat)
+dat$Program <- substr(dat$Program, 1, nchar(dat$Program)-3)
+dat <- dat %>% group_by(Program) %>% summarise(total = sum(Count))
+dat
+```
+
+
+# GO Enrichment of EMT Signature
+```{r}
+go <- fgsea::gmtPathways("~/Data/GeneLists/GOTerms.BP.v6.1.symbols.gmt")
+```
+
+```{r}
+library(GeneOverlap)
+enrichmentTest <- function(gene_set){
+  go_object <- newGeneOverlap(emt_sig, gene_set,
+                              spec = "hg19.gene")
+  go_object <- testGeneOverlap(go_object)
+  results <- go_object@pval
+}
+
+enrichment <- lapply(go, enrichmentTest)
+enrichment <- as.data.frame(do.call("rbind", enrichment))
+colnames(enrichment) <- "pval"
+enrichment$padj <- p.adjust(enrichment$pval, method = "BH")
+```
+
+```{r}
+table(enrichment$padj <= 0.05)
+```
+
+```{r}
+enrichment$Term <- rownames(enrichment)
+```
+
+```{r}
+enrichment$Term <- gsub("GO_", "", enrichment$Term)
+enrichment$Term <- gsub("_", " ", enrichment$Term)
+enrichment$Term <- Hmisc::capitalize(tolower(enrichment$Term))
+```
+
+```{r}
+enrichment %>% arrange(padj) %>% head(300)
+```
+
+```{r}
+plot_terms <- c("Regulation of cell death", "Regulation of cell proliferation",
+                "Epithelium development", "Regulation of cellular component movement",
+                "Regulation of cell adhesion", "Immune system process", "Cell motility",
+                "Response to wounding", "Vasculature development")
+plot_dat <- filter(enrichment, Term %in% plot_terms) %>% arrange(padj)
+plot_dat$Term <- factor(plot_dat$Term, levels=plot_dat$Term)
+
+enrichment_plot <- ggplot(plot_dat, aes(x=-log10(padj), y=Term)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", fill="firebrick") +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(-log10(plot_dat$padj)+0.85))) +
+  xlab("-log10(p-value)") + ylab("") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+```{r}
+enrichment_plot
+```
+
+```{r}
+ggsave(enrichment_plot, device=cairo_pdf(),
+       filename="../figs/emt_sig_go.pdf",
+       width=6.5, height=3)
+```
+
+# GO Enrichment of EMT DOWN Signature
+
+```{r}
+enrichmentTest <- function(gene_set){
+  go_object <- newGeneOverlap(emt_down_sig, gene_set,
+                              spec = "hg19.gene")
+  go_object <- testGeneOverlap(go_object)
+  results <- go_object@pval
+}
+
+enrichment <- lapply(go, enrichmentTest)
+enrichment <- as.data.frame(do.call("rbind", enrichment))
+colnames(enrichment) <- "pval"
+enrichment$padj <- p.adjust(enrichment$pval, method = "BH")
+```
+
+```{r}
+table(enrichment$padj <= 0.05)
+```
+
+```{r}
+enrichment$Term <- rownames(enrichment)
+```
+
+```{r}
+enrichment$Term <- gsub("GO_", "", enrichment$Term)
+enrichment$Term <- gsub("_", " ", enrichment$Term)
+enrichment$Term <- Hmisc::capitalize(tolower(enrichment$Term))
+```
+
+```{r}
+enrichment %>% arrange(padj) %>% head(200)
+```
+
+```{r}
+plot_terms <- c("Cell cycle", "Proteasomal protein catabolic process",
+                "Protein targeting", "Amide biosynthetic process", "Cellular catabolic process", 
+                "Membrane organization")
+plot_dat <- filter(enrichment, Term %in% plot_terms) %>% arrange(padj)
+plot_dat$Term <- factor(plot_dat$Term, levels=plot_dat$Term)
+
+enrichment_plot <- ggplot(plot_dat, aes(x=-log10(padj), y=Term)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", fill="darkblue") +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(-log10(plot_dat$padj)+2))) +
+  xlab("-log10(p-value)") + ylab("") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+```{r}
+enrichment_plot
+```
+```{r}
+ggsave(enrichment_plot, device=cairo_pdf(),
+       filename="../figs/emt_sig_downGenes_go.pdf",
+       width=5, height=2)
+```
+
+# Score cells with signatures
+```{r}
+sample_list <- unique(seurat$SampleID)
+getSampleScore <- function(sampleID){
+  print(paste0("Processing sample: ", sampleID))
+  seurat_subset <- subset(seurat, subset = SampleID == sampleID)
+  seurat_subset <- AddModuleScore(seurat_subset, features=list(emt_sig),
+                                  name="EMT_Sig")
+  dat <- seurat_subset@meta.data
+  return(dat)
+}
+
+score_list <- lapply(sample_list, getSampleScore)
+score_list <- do.call("rbind", score_list)
+seurat$EMT_Sig <- score_list[colnames(seurat), "EMT_Sig1"]
+
+
+saveRDS(seurat, file="../data/pan_cancer_epi.rds")
+```
+
+
+
+
+## FeaturePlot
+```{r}
+dat <- seurat@meta.data
+dat$UMAP1 <- Embeddings(seurat, 'umap')[,1]
+dat$UMAP2 <- Embeddings(seurat, 'umap')[,2]
+dat$EMT_Sig1[dat$EMT_Sig1 < 0] <- 0
+dat$EMT_Sig1[dat$EMT_Sig1 > 1] <- 1
+```
+
+```{r}
+emt_sig_umap <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point(shape=16, size=0.1, aes(colour=EMT_Sig1), alpha=0.5) +
+  scale_colour_gradientn(colours=c(viridis::inferno(100))) +
+  #scale_color_gradientn(colours=c('lightgrey', 'red')) +
+  theme_void() +
+  theme(legend.title=element_blank())
+emt_sig_umap
+```
+
+```{r}
+ggsave(emt_sig_umap, filename="../figs/pan_cancer_sig_umap.png",
+       width=8, height=7, dpi=300)
+```
+
+## RidgePlot
+```{r}
+library(ggridges)
+```
+
+```{r}
+emt_sig_ridge <- ggplot(seurat@meta.data, aes(x=EMT_Sig1, y=SampleID, fill=stat(x))) +
+  geom_density_ridges_gradient(alpha=0.5, quantile_lines=T, quantiles=2,
+                               scale=2.5) +
+  scale_fill_viridis_c(name="EMT Sig", option="A") +
+  scale_x_continuous(limits=c(-0.1, 1.25)) +
+  scale_y_discrete(expand = expand_scale(mult = c(0.01, 0.025))) +
+  ylab("") + xlab("EMP Score") +
+  theme_ridges(center_axis_labels = T) +
+  theme(legend.position="none",
+        axis.text.y=element_text(size=5, color="black"))
+emt_sig_ridge
+```
+
+```{r}
+ggsave(emt_sig_ridge, filename="../figs/pan_cancer_sig_ridge.pdf",
+       width=5, height=13)
+```
+
+## Technical factors
+```{r}
+count_rna <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point(shape=16, size=0.2, aes(colour=log10(nCount_RNA)), alpha=0.5) +
+  scale_colour_gradientn(colours=c(viridis::inferno(100))) +
+  #scale_color_gradientn(colours=c('lightgrey', 'red')) +
+  theme_void() +
+  theme(legend.title=element_blank())
+ggsave(count_rna, filename="../figs/pan_cancer_nCountRNA_umap.png",
+       width=4.5, height=3.5, dpi=600)
+count_rna
+```
+
+```{r}
+feature_rna <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point(shape=16, size=0.2, aes(colour=nFeature_RNA), alpha=0.5) +
+  scale_colour_gradientn(colours=c(viridis::inferno(100))) +
+  #scale_color_gradientn(colours=c('lightgrey', 'red')) +
+  theme_void() +
+  theme(legend.title=element_blank())
+ggsave(feature_rna, filename="../figs/pan_cancer_nFeatureRNA_umap.png",
+       width=4.5, height=3.5, dpi=600)
+feature_rna
+```
+```{r}
+percent_mito <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point(shape=16, size=0.2, aes(colour=percent.mito), alpha=0.5) +
+  scale_colour_gradientn(colours=c(viridis::inferno(100))) +
+  #scale_color_gradientn(colours=c('lightgrey', 'red')) +
+  theme_void() +
+  theme(legend.title=element_blank())
+ggsave(percent_mito, filename="../figs/pan_cancer_percentmito_umap.png",
+       width=4.5, height=3.5, dpi=600)
+percent_mito
+```
+
+
+
+
+
+
+
+
+
+
+

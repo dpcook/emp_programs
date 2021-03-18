@@ -1,0 +1,322 @@
+---
+title: "Pan-cancer TCGA EMP Survival Analysis"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+```
+
+
+# Load and process data
+## Gene expression (RNA-seq)
+```{r}
+rna_seq <- read.delim("~/Data/TCGA_resources/EBPlusPlusAdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv", sep="\t")
+colnames(rna_seq)[2:ncol(rna_seq)] <- substr(colnames(rna_seq)[2:ncol(rna_seq)], 1, 12)
+colnames(rna_seq) <- make.unique(colnames(rna_seq)) #couple duplicated ones
+
+gene_id <- data.frame(gene = rna_seq$gene_id)
+gene_id <- separate(gene_id, col=gene, into=c("Symbol", "ID"))
+gene_id$Symbol[1:29] <- 1:29 #Blank entries
+
+rownames(rna_seq) <- make.unique(gene_id$Symbol)
+rna_seq$gene_id <- NULL
+
+rna_seq <- as.matrix(rna_seq)
+```
+
+Normalize to CPM
+```{r}
+#several NAs that we'll just convert to 0
+rna_seq[is.na(rna_seq)] <- 0
+rna_seq <- (rna_seq / colSums(rna_seq)) * 1e6
+```
+
+## PFS data
+```{r}
+clinical <- read.csv("~/Data/TCGA_resources/Pan_TCGA_PFS_ClinicalDataResource.csv")
+clinical$bcr_patient_barcode <- gsub("-", ".", clinical$bcr_patient_barcode)
+clinical$bcr_patient_barcode <- make.unique(clinical$bcr_patient_barcode)
+```
+
+
+## Tumor purity
+```{r}
+purity <- read.csv("~/Data/TCGA_resources/TumourPurityEstimates_Aran_NatComms.csv")
+```
+
+```{r}
+colnames(purity) <- c("bcr_patient_barcode", "type", "purity")
+```
+
+```{r}
+purity$bcr_patient_barcode <- substr(purity$bcr_patient_barcode, 1, 12)
+purity$bcr_patient_barcode <- gsub("-", ".", purity$bcr_patient_barcode)
+purity$bcr_patient_barcode <- make.unique(purity$bcr_patient_barcode)
+```
+
+Don't want to work with samples with unknown purity
+```{r}
+purity <- na.omit(purity)
+```
+
+## Immune cell proportion
+```{r}
+immune <- read.csv("~/Data/TCGA_resources/pan_cancer_immune_landscape.csv")
+immune$TCGA.Participant.Barcode <- gsub("-", ".", immune$TCGA.Participant.Barcode)
+```
+
+
+# Find common samples
+```{r}
+sample_list <- Reduce(intersect, list(purity$bcr_patient_barcode,
+                                      clinical$bcr_patient_barcode,
+                                      colnames(rna_seq)))
+```
+
+```{r}
+length(sample_list)
+```
+
+```{r}
+purity %>% filter(bcr_patient_barcode %in% sample_list) %>%
+  pull(type) %>% table()
+```
+
+ACC = Adrenocortical Carcinoma
+BLCA = Bladder Urothelial Carcinoma
+BRCA = Breast cancer
+CESC = Cervical Squamous Cell Carcinoma
+COAD = Colorectal adenocarcinoma
+GBM = Glioblastoma
+HNSC = Head and neck squamous cell carcinoma
+KICH = Kidney chromophone (Renal non-clear cell carcinoma)
+KIRC = Renal clear cell carcinoma
+KIRP = Renal papillary cell carcinoma
+LGG = Brain lower grade glioma
+LIHC = Liver Hepatocellular Carcinoma
+LUAD = Lung adenocarcinoma
+LUSC = Lung squamous cell carcinoma
+OV = High-grade serous ovarian cancer
+PRAD = Prostate adenocarcinoma
+READ = Rectal adenocarcinoma
+SKCM = Skin cutaneous melanoma
+THCA = Thyroid carcinoma
+UCEC = Uterine corpus endometrial carcionma
+UCS = Uterina carcinosarcoma
+
+
+
+# Control for tumor purity
+A lot of people make a survival model with the gene set score and purity as covariates in the analysis. But i'm not trying to control for independent effects here. I think that the gene set score is dependent on purity. So I'd like to make a purity-normalized score and then model survival on that.
+
+
+
+```{r}
+ctrl_dat <- purity %>% filter(bcr_patient_barcode %in% sample_list)
+```
+
+```{r}
+exp_mat <- rna_seq[,ctrl_dat$bcr_patient_barcode]
+exp_mat <- log2(exp_mat + 1)
+rownames(exp_mat) <- rownames(rna_seq)
+```
+
+```{r}
+tmp <- lm(exp_mat["EPCAM",] ~ ctrl_dat$purity)
+```
+
+```{r}
+getResiduals <- function(gene){
+  res <- residuals(lm(exp_mat[gene,] ~ ctrl_dat$purity + ctrl_dat$type))
+}
+
+emt_sig <- readLines("~/Projects/emt_programs/output/emp_sig_refined.txt")
+emt_sig <- emt_sig[emt_sig %in% rownames(rna_seq)]
+```
+
+```{r}
+residual_mat <- lapply(emt_sig, getResiduals)
+residual_mat <- do.call("rbind", residual_mat)
+rownames(residual_mat) <- emt_sig
+```
+
+```{r}
+residual_mat <- t(scale(t(residual_mat)))
+```
+
+```{r}
+emp_score <- colMeans(residual_mat)
+```
+
+## Lame multiplication?
+Alternatively I can do a lame multiplication of these epithelial genes * purity
+
+```{r}
+exp_mat <- rna_seq[emt_sig, ctrl_dat$bcr_patient_barcode]
+exp_mat <- exp_mat * (1-purity$purity[match(colnames(exp_mat), purity$bcr_patient_barcode)])
+exp_mat <- log2(exp_mat+1)
+exp_mat <- t(scale(t(exp_mat)))
+emp_score <- colMeans(exp_mat)
+```
+
+
+## No correction?
+```{r}
+exp_mat <- rna_seq[emt_sig, ctrl_dat$bcr_patient_barcode]
+exp_mat <- log2(exp_mat+1)
+exp_mat <- t(scale(t(exp_mat)))
+emp_score <- colMeans(exp_mat)
+```
+
+
+# Test survival
+```{r}
+library(survival)
+library(survminer)
+```
+
+```{r}
+clinical_subset <- clinical %>% filter(bcr_patient_barcode %in% sample_list)
+clinical_subset$EMP <- emp_score[clinical_subset$bcr_patient_barcode]
+clinical_subset$EMP <- scales::rescale(clinical_subset$EMP, to = c(0,1))
+clinical_subset$PFS.time <- as.numeric(clinical_subset$PFS.time)
+clinical_subset <- na.omit(clinical_subset)
+clinical_subset$PFS <- clinical_subset$PFS == "1"
+```
+
+```{r}
+coxph(Surv(PFS.time, PFS)~EMP + type, data=clinical_subset)
+```
+
+Add more clinical data
+
+```{r}
+patient_dat <- read.delim("~/Data/TCGA_resources/clinical_PANCAN_patient_with_followup.tsv", sep="\t")
+patient_dat$bcr_patient_barcode <- gsub("-", ".", patient_dat$bcr_patient_barcode)
+patient_dat <- filter(patient_dat, bcr_patient_barcode %in% sample_list)
+
+clinical_subset$Age <- as.numeric(patient_dat$age_at_initial_pathologic_diagnosis[match(clinical_subset$bcr_patient_barcode, patient_dat$bcr_patient_barcode)])
+clinical_subset$Purity <- purity$purity[match(clinical_subset$bcr_patient_barcode, purity$bcr_patient_barcode)]
+clinical_subset$Sex <- patient_dat$gender[match(clinical_subset$bcr_patient_barcode, patient_dat$bcr_patient_barcode)]
+coxph(Surv(PFS.time, PFS)~EMP + type + Age + Purity, data=clinical_subset)
+```
+
+
+```{r}
+write.csv(clinical_subset, file="../output/tcga_clinical_emp.csv", row.names = F)
+```
+
+
+```{r}
+testCancer <- function(cancer){
+  dat <- subset(clinical_subset, type == cancer)
+  res <- coxph(Surv(PFS.time, PFS)~EMP + Age + Purity, data=dat)
+  return(res)
+}
+cancer_list <- unique(clinical_subset$type)
+
+tmp <- lapply(cancer_list, testCancer)
+names(tmp) <- cancer_list
+tmp
+```
+
+#Visualization
+```{r}
+dat_plot <- ggplot(clinical_subset, aes(x=EMP, y=type)) +
+  geom_density_ridges_gradient(aes(fill=stat(x)),
+                               quantile_lines=T, quantiles=2, alpha=0.5) +
+  scale_fill_viridis_c(name="EMP Sig", option="A") +
+  ylab("Cancer type") + xlab("EMP Score") +
+  theme_ridges() +
+  theme(legend.position="none")
+dat_plot
+
+ggsave(dat_plot, filename="../figs/pan_cancer_tcga_emp_score.pdf",
+       width=3.5, height=5)
+ggsave(dat_plot, filename="../figs/pan_cancer_tcga_emp_score.png",
+       width=3.5, height=5)
+```
+
+# Immune cell proportion
+```{r}
+immune_proportions <- immune[,c(1,2,3,
+                                37:58)]
+immune_proportions <- na.omit(immune_proportions)
+common_samples <- intersect(immune_proportions$TCGA.Participant.Barcode,
+                            colnames(rna_seq))
+immune_proportions <- filter(immune_proportions,
+                             TCGA.Participant.Barcode %in% common_samples)
+```
+
+```{r}
+exp_mat <- rna_seq[emt_sig, common_samples]
+exp_mat[exp_mat < 0] <- 0 #some are very slightly negative??
+exp_mat <- log1p(exp_mat)
+exp_mat <- t(scale(t(exp_mat)))
+immune_proportions$EMP_Score <- colMeans(exp_mat[,immune_proportions$TCGA.Participant.Barcode])
+```
+
+```{r}
+write.csv(immune_proportions, file="../output/tcga_immune_composition_emp.csv",
+          row.names = F)
+```
+
+
+
+```{r}
+testEMP <- function(cell_type){
+  score <- immune_proportions[,cell_type]
+  
+  model_res <- summary(lm(score ~ immune_proportions$EMP_Score + immune_proportions$TCGA.Study))
+  res <- data.frame(Coef = model_res$coefficients[2,1],
+                    pval = model_res$coefficients[2,4],
+                    CellType = cell_type)
+}
+```
+
+```{r}
+cell_type_list <- colnames(immune_proportions)[4:25]
+```
+
+```{r}
+cell_type_list
+```
+
+
+```{r}
+#Can log transform proportions to make them a little more normally distributed
+immune_proportions[,cell_type_list] <- log(immune_proportions[,cell_type_list] + 0.01)
+
+prop_res <- lapply(cell_type_list, testEMP)
+prop_res <- do.call("rbind", prop_res)
+prop_res$padj <- p.adjust(prop_res$pval, method="BH")
+
+#order
+prop_res <- prop_res %>%
+  arrange(Coef)
+prop_res$CellType <- factor(prop_res$CellType, levels=prop_res$CellType)
+prop_res$Sig <- ifelse(prop_res$padj <= 0.05, "Sig", "Not Sig")
+```
+
+```{r}
+celltype_plot <- ggplot(prop_res, aes(x=Coef, y = CellType)) +
+  geom_point(aes(size=-log10(padj), fill=Sig), shape=21, color="black") +
+  geom_vline(xintercept = 0, linetype=2) +
+  scale_fill_manual(values=c('lightgrey', 'firebrick')) +
+  xlab("EMP Score Coefficient") + ylab("") +
+  theme_classic() +
+  theme(axis.text.y=element_text(size=12, color="black"),
+        axis.text.x=element_text(size=10, color="black"),
+        axis.title=element_text(size=12))
+celltype_plot
+```
+
+```{r}
+ggsave(celltype_plot, filename="../figs/pan_cancer_tcga_celltype_proportion.pdf",
+       device=cairo_pdf,
+       width=6.5, height=5.5)
+```
+
+
+

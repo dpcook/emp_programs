@@ -1,0 +1,157 @@
+---
+title: "Figure S2 Panels"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(UpSetR)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+```{r}
+master_meta <- readRDS("../../output/master_metadata.rds")
+master_meta <- do.call("bind_rows", master_meta)
+```
+
+
+# Set up gene sets
+```{r}
+hallmarks <- fgsea::gmtPathways("~/Data/GeneLists/hallmark.genesets.v6.1.symbols.gmt")
+hallmark_emt <- hallmarks["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]
+
+go_terms <- fgsea::gmtPathways("~/Data/GeneLists/GOTerms.BP.v6.1.symbols.gmt")
+go_emt <- go_terms["GO_EPITHELIAL_TO_MESENCHYMAL_TRANSITION"]
+
+#cancerSEA
+cancer_sea <- readRDS("~/Data/GeneLists/cancerSEA/cancerSEA_gene_sets.rds")
+names(cancer_sea) <- paste0("CancerSEA_", names(cancer_sea))
+cancer_sea_emt <- cancer_sea["CancerSEA_EMT"]
+
+#My conserved upregulated list
+conserved_mes <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_upregulated_genes.csv")[-1])
+names(conserved_mes) <- "Conserved_EMT_Up"
+
+#My conserved downregulated list
+conserved_epi <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_downregulated_genes.csv")[-1])
+names(conserved_epi) <- "Conserved_EMT_Down"
+
+#dbEMT
+dbEMT <- read.csv("~/Data/GeneLists/Zhao_dbEMT.csv")
+dbEMT <- list(dbEMT$Symbol)
+names(dbEMT) <- "dbEMT"
+
+#Puram HNSCC pEMT
+puram <- read.csv("~/Data/GeneLists/puram_hnscc_pEMT_signatures.csv")
+puram <- list(unique(puram$Gene)) #All unique genes from their list of 50-gene NMF programs
+names(puram) <- "Puram_pEMT"
+
+#Taube Core EMT Up
+taube_up <- list(read_lines("~/Data/GeneLists/Taube_Core_EMT_Up.txt"))
+names(taube_up) <- "Taube_Core_EMT_Up"
+
+#Kinker et al. EMT signatures
+kinker <- read.csv("~/Data/GeneLists/Kinker_Tirosh_RHPs.csv")
+kinker_1 <- list(Kinker_1 = kinker$EMT.I)
+kinker_2 <- list(Kinker_2 = kinker$EMT.II)
+kinker_3 <- list(Kinker_3 = kinker$EMT.III)
+```
+
+```{r}
+emt_sets <- c(cancer_sea_emt, hallmark_emt,
+             go_emt,  conserved_mes, dbEMT, puram, taube_up,
+             kinker_1, kinker_2, kinker_3)
+```
+
+```{r}
+names(emt_sets)
+```
+
+```{r}
+names(emt_sets) <- c("CancerSEA", "Hallmark", "GO", 
+                     "Cook", "dbEMT", "Puram_pEMT", "Taube",
+                     "Kinker_I", "Kinker_II", "Kinker_III")
+```
+
+# Fig S2A
+## UpSet
+```{r}
+library(UpSetR)
+```
+
+```{r}
+emt_genes <- unique(unlist(emt_sets))
+emt_membership <- fromList(emt_sets)
+rownames(emt_membership) <- emt_genes
+```
+
+```{r}
+upset_plot <- upset(emt_membership, order.by="freq",
+      nsets = length(emt_sets),
+      nintersects = 15,
+      text.scale = c(1.3, 1.3, 1.3, 1.3, 1.5, 1.3),
+      mb.ratio = c(0.4, 0.6))
+```
+
+```{r}
+cairo_pdf(filename = "emt_geneset_upset.pdf",
+          width=6, height=4)
+upset_plot
+dev.off()
+```
+
+## Gene counts
+```{r}
+list_counts <- as.data.frame(rowSums(emt_membership))
+colnames(list_counts) <- "Count"
+list_counts$Gene <- rownames(emt_membership)
+list_counts <- arrange(list_counts, desc(Count))
+list_counts$Index <- 1:nrow(list_counts)
+```
+
+```{r}
+count_plot <- ggplot(list_counts, aes(x=Index, y=Count)) +
+  geom_point(size=0.25, color="black") +
+  geom_vline(xintercept = 0, linetype = 2, size=0.25) +
+  xlab("") + ylab("Gene set count") +
+  scale_y_continuous(limits = c(1,10), breaks = c(2,4,6,8,10)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=5, color="black"),
+        axis.title=element_text(size=5),
+        axis.line = element_line(size=0.25),
+        axis.ticks = element_line(size=0.25))
+ggsave(count_plot, filename = "EMT_gene_set_frequency.pdf",
+       width=3.2, height=4.25, units="cm")
+```
+
+```{r}
+count_plot
+```
+
+```{r}
+list_counts
+```
+
+# Correlation of gene set scores
+```{r}
+emt_cor <- cor(master_meta[,names(emt_sets)])
+```
+
+```{r}
+pheatmap(emt_cor,
+         color = colorRampPalette(rev(brewer.pal(7, "RdBu")))(100),
+         breaks = seq(-1, 1, length.out=101),
+         show_colnames=F,
+         treeheight_col = 0,
+         treeheight_row = 25,
+         legend=F,
+         fontsize_row = 12,
+         clustering_method="ward.D2",
+         border_color = "black",
+         display_numbers = T,
+         number_color="black",
+         filename = "score_heatmap.pdf",
+         width=4.75, height=3.5)
+```

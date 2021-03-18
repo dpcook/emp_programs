@@ -1,0 +1,17 @@
+---
+title: "Pan Cancer - EMP Scoring"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+
+# Load the data
+```{r}
+seurat <- readRDS("../")
+```
+
