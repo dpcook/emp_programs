@@ -1,0 +1,196 @@
+---
+title: "Figure S2 - QC Metrics"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(cowplot)
+```
+
+# Load the data
+```{r}
+seurat <- readRDS("../../../data/pan_cancer_epi.rds")
+```
+
+# Cell count
+```{r}
+cols <- RColorBrewer::brewer.pal(7, "Dark2")
+
+plot_dist <- function(cancer){
+  df <- seurat@meta.data %>%
+    filter(Cancer == cancer) %>%
+    group_by(Source, SampleID) %>%
+    summarise(Count = length(SampleID)) %>%
+    arrange(Source, desc(Count))
+  df$SampleID <- factor(df$SampleID, levels=df$SampleID)
+  cancer_emp <- ggplot(df, aes(x=SampleID, y=Count)) +
+    geom_point(aes(fill=Source), shape=21, color="black", size=2) +
+    scale_fill_manual(values=c(cols[1:length(unique(df$Source))]),
+                      name="Study") +
+    xlab("Samples") + ylab("Cell count") + ggtitle(cancer) +
+    #facet_wrap(~Source, scales="free") +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.title.x = element_text(size=12),
+          axis.text.y = element_text(size=12, color="black"),
+          axis.title.y = element_text(size=14),
+          legend.text=element_text(size=12),
+          legend.title=element_text(size=12))
+  return(cancer_emp)
+}
+```
+
+```{r}
+colorectal <- plot_dist("Colorectal")
+gastric <- plot_dist("Gastric")
+lung <- plot_dist("Lung")
+ovarian <- plot_dist("Ovarian")
+pdac <- plot_dist("PDAC")
+breast <- plot_dist("Breast")
+scc <- plot_dist("SCC")
+npc <- plot_dist("NPC")
+```
+
+```{r}
+top_row <- cowplot::plot_grid(lung)
+second_row <- cowplot::plot_grid(breast, gastric, rel_widths = c(4.5,1), ncol=2)
+third_row <- cowplot::plot_grid(colorectal, ovarian, rel_widths = c(3,1), ncol=2)
+bottom_row <- cowplot::plot_grid(gastric, npc, pdac, scc,
+                                 rel_widths = c(1, 1.2, 1.5, 1), ncol=4)
+```
+
+```{r}
+all_plots <- cowplot::plot_grid(top_row, second_row, third_row, bottom_row, ncol=1)
+```
+
+```{r}
+cowplot::save_plot(all_plots,
+                   filename="cell_counts.pdf",
+                   base_width=15, base_height=10)
+```
+
+# UMI count
+Get same sample order
+```{r}
+count_summary <- seurat@meta.data %>%
+    group_by(Cancer, Source, SampleID) %>%
+    summarise(Count = length(SampleID)) %>%
+    arrange(Source, desc(Count))
+```
+
+
+```{r}
+cols <- RColorBrewer::brewer.pal(7, "Dark2")
+
+plot_dist <- function(cancer){
+  df <- seurat@meta.data %>%
+    filter(Cancer==cancer)
+  df$SampleID <- factor(df$SampleID, 
+                        levels=count_summary %>% filter(Cancer==cancer) %>% pull(SampleID))
+  cancer_emp <- ggplot(df, aes(x=SampleID, y=log10(nCount_RNA))) +
+    geom_boxplot(aes(fill=Source), color="black", outlier.size = 0) +
+    scale_fill_manual(values=c(cols[1:length(unique(df$Source))]),
+                      name="Study") +
+    xlab("Samples") + ylab("log10(UMI)") + ggtitle(cancer) +
+    #facet_wrap(~Source, scales="free") +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.title.x = element_text(size=12),
+          axis.text.y = element_text(size=12, color="black"),
+          axis.title.y = element_text(size=14),
+          legend.text=element_text(size=12),
+          legend.title=element_text(size=12))
+  return(cancer_emp)
+}
+```
+
+```{r}
+colorectal <- plot_dist("Colorectal")
+gastric <- plot_dist("Gastric")
+lung <- plot_dist("Lung")
+ovarian <- plot_dist("Ovarian")
+pdac <- plot_dist("PDAC")
+breast <- plot_dist("Breast")
+scc <- plot_dist("SCC")
+npc <- plot_dist("NPC")
+```
+
+```{r}
+top_row <- cowplot::plot_grid(lung)
+second_row <- cowplot::plot_grid(breast, gastric, rel_widths = c(4.5,1), ncol=2)
+third_row <- cowplot::plot_grid(colorectal, ovarian, rel_widths = c(3,1), ncol=2)
+bottom_row <- cowplot::plot_grid(gastric, npc, pdac, scc,
+                                 rel_widths = c(1, 1.2, 1.5, 1), ncol=4)
+```
+
+```{r}
+all_plots <- cowplot::plot_grid(top_row, second_row, third_row, bottom_row, ncol=1)
+```
+
+```{r}
+cowplot::save_plot(all_plots,
+                   filename="UMI_counts.pdf",
+                   base_width=15, base_height=10)
+```
+
+# percent mito
+
+```{r}
+cols <- RColorBrewer::brewer.pal(7, "Dark2")
+
+plot_dist <- function(cancer){
+  df <- seurat@meta.data %>%
+    filter(Cancer==cancer)
+  df$SampleID <- factor(df$SampleID, 
+                        levels=count_summary %>% filter(Cancer==cancer) %>% pull(SampleID))
+  cancer_emp <- ggplot(df, aes(x=SampleID, y=percent.mito)) +
+    geom_boxplot(aes(fill=Source), color="black", outlier.size = 0) +
+    scale_fill_manual(values=c(cols[1:length(unique(df$Source))]),
+                      name="Study") +
+    xlab("Samples") + ylab("% mito") + ggtitle(cancer) +
+    #facet_wrap(~Source, scales="free") +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.title.x = element_text(size=12),
+          axis.text.y = element_text(size=12, color="black"),
+          axis.title.y = element_text(size=14),
+          legend.text=element_text(size=12),
+          legend.title=element_text(size=12))
+  return(cancer_emp)
+}
+```
+
+```{r}
+colorectal <- plot_dist("Colorectal")
+gastric <- plot_dist("Gastric")
+lung <- plot_dist("Lung")
+ovarian <- plot_dist("Ovarian")
+pdac <- plot_dist("PDAC")
+breast <- plot_dist("Breast")
+scc <- plot_dist("SCC")
+npc <- plot_dist("NPC")
+```
+
+```{r}
+top_row <- cowplot::plot_grid(lung)
+second_row <- cowplot::plot_grid(breast, gastric, rel_widths = c(4.5,1), ncol=2)
+third_row <- cowplot::plot_grid(colorectal, ovarian, rel_widths = c(3,1), ncol=2)
+bottom_row <- cowplot::plot_grid(gastric, npc, pdac, scc,
+                                 rel_widths = c(1, 1.2, 1.5, 1), ncol=4)
+```
+
+```{r}
+all_plots <- cowplot::plot_grid(top_row, second_row, third_row, bottom_row, ncol=1)
+```
+
+```{r}
+cowplot::save_plot(all_plots,
+                   filename="percent_mito.pdf",
+                   base_width=15, base_height=10)
+```
+

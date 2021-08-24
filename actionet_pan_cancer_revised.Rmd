@@ -1,0 +1,592 @@
+---
+title: "ACTIONet Pan-Cancer"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(ACTIONet)
+library(SingleCellExperiment)
+library(tidyverse)
+library(viridis)
+library(RColorBrewer)
+library(UpSetR)
+library(ComplexHeatmap)
+library(UCell)
+```
+
+# Load the data
+```{r}
+seurat <- readRDS("../output/combined_epi_revised.rds")
+```
+
+```{r}
+DimPlot(seurat, group.by="Cancer")
+```
+
+```{r}
+table(seurat$SampleID)
+```
+
+
+```{r}
+#Number of unique samples
+length(unique(seurat$SampleID))
+```
+
+## Get sample list
+```{r}
+sample_list <- unique(seurat$SampleID)
+```
+
+Get the NPC samples. This is important because this data doesn't have UMI counts--just log-transformed counts. Will need to do some tweaking when processing them
+```{r}
+npc_samples <- grep("NPC_Chen", sample_list, value=T)
+```
+
+
+# ACTIONet
+Subset seurat object by sample and run ACTIONet on it
+```{r}
+runACTION <- function(sample){
+  print(paste0("Processing sample: ", sample))
+  #Subset seurat and convert to SCE
+  cells_keep <- colnames(seurat)[seurat$SampleID == sample]
+  seurat_subset <- subset(DietSeurat(seurat), cells = cells_keep)
+  
+  ###NPC samples don't have UMIs--just log-transformed counts
+  if(sample %in% npc_samples){
+    print("Fixing NPC sample")
+    seurat_subset[["RNA"]]@data <- seurat_subset[["RNA"]]@counts
+  }
+  ###
+  
+  sce <- Seurat::as.SingleCellExperiment(seurat_subset, assay="RNA")
+  #Run ACTIONet
+  ace <- reduce.ace(sce, reduced_dim = 20) #dimensionality of initial factorization. Default is 50--we'll go a bit lower
+  rm(sce)
+  rm(seurat_subset)
+  action <- run.ACTIONet(ace=ace, k_max=10,
+                         min_cells_per_arch = 5,
+                         seed=123) #Tried some tweaks and this works pretty well for me
+  return(action)
+}
+```
+
+```{r}
+action_list <- lapply(sample_list, runACTION)
+names(action_list) <- sample_list
+
+saveRDS(action_list, file="../output/ACTIONet_list.rds")
+```
+
+```{r}
+action_list <- readRDS("../output/ACTIONet_list.rds")
+```
+
+
+# Build master metadata
+```{r}
+meta_list <- list()
+for(i in 1:length(action_list)){
+  meta_list[[i]] <- data.frame(Dim1 = action_list[[i]]$ACTIONet2D[,1],
+                               Dim2 = action_list[[i]]$ACTIONet2D[,2],
+                               Archetype_Membership = factor(action_list[[i]]$assigned_archetype))
+  colnames(action_list[[i]]$archetype_footprint) <- paste0("A", 1:ncol(action_list[[i]]$archetype_footprint))
+  meta_list[[i]] <- cbind(meta_list[[i]], action_list[[i]]$archetype_footprint)
+}
+names(meta_list) <- sample_list
+```
+
+
+# EMT Gene Set Scoring
+## Load gene sets
+```{r}
+hallmarks <- fgsea::gmtPathways("~/Data/GeneLists/hallmark.genesets.v6.1.symbols.gmt")
+hallmark_emt <- hallmarks["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]
+
+go_terms <- fgsea::gmtPathways("~/Data/GeneLists/GOTerms.BP.v6.1.symbols.gmt")
+go_emt <- go_terms["GO_EPITHELIAL_TO_MESENCHYMAL_TRANSITION"]
+
+#cancerSEA
+cancer_sea <- readRDS("~/Data/GeneLists/cancerSEA/cancerSEA_gene_sets.rds")
+names(cancer_sea) <- paste0("CancerSEA_", names(cancer_sea))
+cancer_sea_emt <- cancer_sea["CancerSEA_EMT"]
+
+#My conserved upregulated list
+conserved_mes <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_upregulated_genes.csv")[-1])
+names(conserved_mes) <- "Conserved_EMT_Up"
+
+#My conserved downregulated list
+conserved_epi <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_downregulated_genes.csv")[-1])
+names(conserved_epi) <- "Conserved_EMT_Down"
+
+#dbEMT
+dbEMT <- read.csv("~/Data/GeneLists/Zhao_dbEMT.csv")
+dbEMT <- list(dbEMT$Symbol)
+names(dbEMT) <- "dbEMT"
+
+#Puram HNSCC pEMT
+puram <- read.csv("~/Data/GeneLists/puram_hnscc_pEMT_signatures.csv")
+puram <- list(unique(puram$Gene)) #All unique genes from their list of 50-gene NMF programs
+names(puram) <- "Puram_pEMT"
+
+#Taube Core EMT Up
+taube_up <- list(read_lines("~/Data/GeneLists/Taube_Core_EMT_Up.txt"))
+names(taube_up) <- "Taube_Core_EMT_Up"
+
+#Kinker et al. EMT signatures
+kinker <- read.csv("~/Data/GeneLists/Kinker_Tirosh_RHPs.csv")
+kinker_1 <- list(Kinker_1 = kinker$EMT.I)
+kinker_2 <- list(Kinker_2 = kinker$EMT.II)
+kinker_3 <- list(Kinker_3 = kinker$EMT.III)
+
+# Tan EMT Cancer Gene set
+tan_emt <- read.table("~/Data/GeneLists/Tan_Mes_Signature.txt")
+tan_emt <- list(Tan_EMT = tan_emt$V2)
+```
+
+```{r}
+emt_sets <- c(cancer_sea_emt, hallmark_emt,
+             go_emt,  conserved_mes, dbEMT, puram, taube_up,
+             kinker_1, kinker_2, kinker_3, tan_emt)
+```
+
+```{r}
+names(emt_sets)
+```
+
+```{r}
+names(emt_sets) <- c("CancerSEA", "Hallmark", "GO", 
+                     "Cook", "dbEMT", "Puram_pEMT", "Taube",
+                     "Kinker_I", "Kinker_II", "Kinker_III", "Tan_EMT")
+```
+
+## Compare composition
+### UpSet Plot
+```{r}
+library(UpSetR)
+```
+
+```{r}
+emt_genes <- unique(unlist(emt_sets))
+emt_membership <- fromList(emt_sets)
+rownames(emt_membership) <- emt_genes
+```
+
+```{r}
+upset_plot <- upset(emt_membership, order.by="freq",
+      nsets = length(emt_sets),
+      nintersects = 15,
+      text.scale = c(1.3, 1.3, 1.3, 1.3, 1.5, 1.3),
+      mb.ratio = c(0.4, 0.6))
+```
+
+```{r}
+cairo_pdf(filename = "../figs/emt_geneset_upset.pdf",
+          width=5, height=4)
+upset_plot
+dev.off()
+```
+
+### Set count
+```{r}
+list_counts <- as.data.frame(rowSums(emt_membership))
+colnames(list_counts) <- "Count"
+list_counts$Gene <- rownames(emt_membership)
+list_counts <- arrange(list_counts, desc(Count))
+list_counts$Index <- 1:nrow(list_counts)
+```
+
+```{r}
+count_plot <- ggplot(list_counts, aes(x=Index, y=Count)) +
+  geom_point(size=0.25, color="black") +
+  geom_vline(xintercept = 0, linetype = 2, size=0.25) +
+  xlab("") + ylab("Gene set count") +
+  scale_y_continuous(limits = c(1,10), breaks = c(2,4,6,8,10)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=5, color="black"),
+        axis.title=element_text(size=5),
+        axis.line = element_line(size=0.25),
+        axis.ticks = element_line(size=0.25))
+ggsave(count_plot, filename = "../figs/EMT_gene_set_frequency.pdf",
+       width=3.2, height=3, units="cm")
+```
+
+```{r}
+count_plot
+```
+
+```{r}
+list_counts
+```
+
+## Scoring
+We'll run UCell on each individual sample
+```{r}
+for(i in 1:length(sample_list)){
+  print(paste0("Processing sample ", i, "/", length(sample_list)))
+  seurat_subset <- subset(DietSeurat(seurat), subset = SampleID == sample_list[i])
+  
+  ###NPC samples don't have UMIs--just log-transformed counts
+  if(sample_list[i] %in% npc_samples){
+    print("Fixing NPC sample")
+    seurat_subset[["RNA"]]@data <- seurat_subset[["RNA"]]@counts
+  }
+  ###
+  
+  seurat_subset <- CellCycleScoring(seurat_subset, s.features = cc.genes.updated.2019$s.genes,
+                                    g2m.features = cc.genes.updated.2019$g2m.genes)
+  # Gene set score each EMT gene set
+  for(n in 1:length(emt_sets)){
+    print(paste0("Scoring ", names(emt_sets[n])))
+    seurat_subset <- AddModuleScore_UCell(seurat_subset, features = emt_sets[n],
+                                          name="")
+  }
+  
+  #Merge data into meta_list
+  meta_list[[i]] <- cbind(meta_list[[i]], 
+                        seurat_subset@meta.data[,c(names(emt_sets),  
+                                                   "S.Score", "G2M.Score", "Phase", 
+                                                   "percent.mito", "nCount_RNA", "nFeature_RNA")])
+}
+
+saveRDS(meta_list, file = "../output/master_metadata.rds")
+```
+
+
+# Median EMT Score
+```{r}
+master_meta <- do.call("bind_rows", meta_list)
+master_meta$SampleID <- seurat$SampleID[rownames(master_meta)]
+```
+
+```{r}
+emt_avg <- master_meta[,c("SampleID", names(emt_sets))]
+emt_avg <- tidyr::pivot_longer(emt_avg,
+                               !SampleID,
+                               names_to="gene_set",
+                               values_to="score")
+emt_avg <- emt_avg %>% 
+  group_by(SampleID, gene_set) %>%
+  summarise(median = median(score))
+
+emt_avg <- emt_avg %>% pivot_wider(names_from=gene_set, values_from=median)
+```
+
+```{r}
+emt_mat <- as.matrix(emt_avg[,2:ncol(emt_avg)])
+rownames(emt_mat) <- emt_avg$SampleID
+emt_mat <- scale(emt_mat, scale=T, center=T)
+#emt_mat[emt_mat > 1.5] <- 1.5
+#emt_mat[emt_mat < -1.5] <- -1.5
+```
+
+
+
+```{r}
+cols <- paletteer::paletteer_c("scico::berlin", n=100)
+
+pdf(file = "../figs/emt_geneset_score_median.pdf",
+    width=4, height=12.5)
+pheatmap(emt_mat,
+         color = cols,
+         breaks = seq(-2, 2, length.out = 100),
+         border_color="black",
+         show_colnames=T,
+         angle_col = "45",
+         fontsize_row = 4.5,
+         treeheight_col = 15,
+         treeheight_row = 15,
+         legend=F,
+         name = NULL,
+         clustering_method="ward.D2")
+dev.off()
+
+#Just to get berlin legend:
+pheatmap::pheatmap(emt_mat,
+         color = cols,
+         breaks = seq(-2, 2, length.out = 101),
+         border_color="black",
+         show_colnames=T,
+         angle_col = "45",
+         treeheight_col = 10,
+         treeheight_row = 10,
+         fontsize_row = 4.5,
+         legend=T,
+         name = NULL,
+         clustering_method="ward.D2",
+         file = "../figs/emt_geneset_score_median_4Legend.png",
+    width=4, height=12.5)
+```
+
+# Correlation of EMT gene sets to each other
+```{r}
+emt_cor <- cor(master_meta[,names(emt_sets)])
+```
+
+```{r}
+pdf(file = "../figs/emt_geneset_score_correlation.pdf",
+    width=4.25, height=3.2)
+pheatmap(emt_cor,
+         color = viridis::inferno(100),
+         #breaks = seq(0, 1, length.out=101),
+         show_colnames=F,
+         treeheight_col = 0,
+         treeheight_row = 15,
+         legend=F,
+         fontsize_row = 12,
+         clustering_method="ward.D2",
+         border_color = "black",
+         display_numbers = T,
+         number_color="grey50")
+dev.off()
+```
+
+# Plot archetype membership
+## By ACTIONet embedding
+```{r}
+cols <- RColorBrewer::brewer.pal(n=9, "Set1")
+cols <- cols[-6]
+```
+
+```{r}
+for(i in 1:length(sample_list)){
+  arch_plot <- ggplot(meta_list[[i]], aes(x=Dim1, y=Dim2)) +
+    geom_point(size=1, shape=16, aes(color=Archetype_Membership)) +
+    scale_color_manual(values = cols[1:length(unique(meta_list[[i]]$Archetype_Membership))]) +
+    theme_classic() +
+    theme(axis.text = element_text(size=12, color="black"),
+          legend.text = element_text(size=12))
+  ggsave(arch_plot, device = cairo_pdf(),
+         filename = paste0("../figs/archetype_membership/",
+                           sample_list[[i]], "_arch_membership.pdf"),
+         width=5.75, height=3.5)
+  dev.off()
+}
+```
+
+## By PCA
+SCTransform tends to make better PCA embeddings, but runtime gets pretty long. I'm not really showing these PCA embeddings in the paper, so I'll opt for speed here. Can replace individual ones if needed
+```{r}
+plotArch_PCA <- function(sampleID){
+  print(paste0("Processing sample: ", sampleID))
+  cells <- rownames(meta_list[[sampleID]])
+  seurat_subset <- subset(DietSeurat(seurat), cells = cells)
+  
+  ###NPC samples don't have UMIs--just log-transformed counts
+  if(sampleID %in% npc_samples){
+    print("Fixing NPC sample")
+    seurat_subset[["RNA"]]@data <- seurat_subset[["RNA"]]@counts
+  }
+  ###
+
+  seurat_subset <- FindVariableFeatures(seurat_subset)
+  seurat_subset <- ScaleData(seurat_subset, vars.to.regress="percent.mito")
+  seurat_subset <- RunPCA(seurat_subset, verbose=F)
+  
+  dat <- meta_list[[sampleID]]
+  dat$PC1 <- Embeddings(seurat_subset, "pca")[,1]
+  dat$PC2 <- Embeddings(seurat_subset, "pca")[,2]
+  
+  #Get specific cell for each archetype
+  dat$Archetype_Membership <- paste0("A", dat$Archetype_Membership)
+  archs <- unique(dat$Archetype_Membership)
+  arch_dat <- dat[,c("Archetype_Membership", archs)]
+  arch_dat$Cell <- rownames(dat)
+  arch_dat <- arch_dat %>% 
+    pivot_longer(!c(Archetype_Membership, Cell), 
+                 names_to = "Archetype",
+                 values_to = "Score") %>%
+    group_by(Archetype) %>%
+    filter(Score == max(Score))
+  arch_dat$PC1 <- dat[arch_dat$Cell, "PC1"]
+  arch_dat$PC2 <- dat[arch_dat$Cell, "PC2"]
+  
+  
+  pca_plot <- ggplot(dat, aes(PC1, PC2)) +
+    geom_point(size=1, shape=16, aes(color=Archetype_Membership), alpha=0.5) +
+    geom_point(data=arch_dat, aes(fill=Archetype_Membership), shape=21, 
+               colour="black", size=4) +
+    scale_color_brewer(palette="Dark2") +
+    scale_fill_brewer(palette="Dark2") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          legend.title=element_text(size=12),
+          legend.text=element_text(size=12))
+  
+  ggsave(pca_plot, filename= paste0("../figs/archetype_membership_pca/",
+                                    sampleID,  "_arch_membership.pdf"),
+         width=4.5, height=2.5)
+  
+}
+
+
+lapply(sample_list, plotArch_PCA)
+```
+
+
+# Correlation of Archetypes w/ EMT
+
+```{r}
+getCor <- function(df){
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  cor_mat <- cor(df[,total_arch], df[,names(emt_sets)])
+}
+
+cor_list <- lapply(meta_list, getCor)
+```
+
+Need to get a list that matches source to sample
+
+```{r}
+annotation <- unique(seurat@meta.data[,c("Source", "Cancer", "SampleID")])
+annotation$Source <- paste0(annotation$Source, "_", annotation$Cancer)
+unique_source <- unique(annotation$Source)
+```
+
+Go source by source, making heatmap lists for each patient within that source
+
+Oops, just meant to have gene sets ordered the same in each list
+
+```{r}
+gene_set_order <- c("Taube", "Tan_EMT", "GO", "CancerSEA", "Kinker_II", "Kinker_III",
+                    "Hallmark", "Puram_pEMT", "dbEMT", "Cook", "Kinker_I")
+```
+
+
+```{r}
+all_heatmaps <- list()
+for(i in 1:length(unique_source)){
+  samples <- annotation %>% filter(Source == unique_source[i]) %>% pull(SampleID)
+  
+  heat_list <- NULL
+  for(n in 1:length(samples)){
+    cols <- colorRampPalette(rev(brewer.pal(n = 9, name = "RdBu")))(5)
+    col_fun = circlize::colorRamp2(c(-0.75, -0.25, 0, 0.25, 0.75), cols)
+    #lgd = Legend(col_fun = col_fun, title = "Pearson\ncorrelation", border = "black")
+    heat <- Heatmap(t(cor_list[[samples[n]]])[gene_set_order,], 
+                  name=samples[n],
+                  column_title = word(samples[n], start=3, end=-1, sep="_"),
+                  column_title_gp = gpar(fontsize = 10),
+                  col=col_fun,
+                  rect_gp = gpar(col = "black", lwd = 1),
+                  show_column_dend = FALSE,
+                  cluster_rows = F,
+                  show_heatmap_legend=F)
+                  #heatmap_legend_param = list(col_fun = col_fun, 
+                   #                           title = "Pearson\ncorrelation", 
+                    #                          border = "black",
+                     #                         title_gp = gpar(col = "black", fontsize = 12)))
+    
+    heat_list <- heat_list + heat
+  }
+  all_heatmaps[[i]] <- heat_list
+  draw(all_heatmaps[[i]] + lgd)
+}
+```
+
+```{r}
+table(annotation$Source)
+```
+
+```{r}
+unique_source #order of all_heatmaps
+```
+
+
+```{r}
+#pdf(file = "../figs/archetype_emt_correlation_Durante_Uveal.pdf",
+#    width=14, height=2.15)
+#all_heatmaps[[1]]
+#dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Kim_Lung.pdf",
+    width=19, height=2.15)
+all_heatmaps[[5]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Lambrechts_Lung.pdf",
+    width=9.5, height=2.15)
+all_heatmaps[[6]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Laughney_Lung.pdf",
+    width=8.35, height=2.15)
+all_heatmaps[[7]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Lee_Colorectal.pdf",
+    width=23.5, height=2.15)
+all_heatmaps[[1]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Ji_SCC.pdf",
+    width=6.2, height=2.15)
+all_heatmaps[[16]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Starr_Ovarian.pdf",
+    width=5.5, height=2.15)
+all_heatmaps[[10]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Steele_PDAC.pdf",
+    width=14.5, height=2.15)
+all_heatmaps[[12]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Uhlitz_Colorectal.pdf",
+    width=6.25, height=2.15)
+all_heatmaps[[2]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Wu_Breast.pdf",
+    width=4.8, height=2.15)
+all_heatmaps[[13]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Sathe_Gastric.pdf",
+    width=8, height=2.15)
+all_heatmaps[[4]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Qian_Breast.pdf",
+    width=16, height=2.15)
+all_heatmaps[[14]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Qian_Colorectal.pdf",
+    width=15, height=2.15)
+all_heatmaps[[3]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Qian_Lung.pdf",
+    width=19, height=2.15)
+all_heatmaps[[8]]
+dev.off()
+
+pdf(file = "../figs/archetype_emt_correlation_Qian_Ovarian.pdf",
+    width=7, height=2.15)
+all_heatmaps[[11]]
+dev.off()
+```
+
+
+# EMT correlation values
+```{r}
+cor_list_merge <- cor_list
+for(i in 1:length(cor_list_merge)){
+  rownames(cor_list_merge[[i]]) <- paste0(names(cor_list_merge)[i], "_", rownames(cor_list_merge[[i]]))
+}
+cor_list_merge <- do.call("rbind", cor_list_merge)
+```
+
+```{r}
+write.csv(cor_list_merge, file="../output/archetype_emt_correlation.csv")
+```
+
+
+

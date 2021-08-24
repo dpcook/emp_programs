@@ -1,0 +1,567 @@
+---
+title: "Figure 4 Panels"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(factoextra)
+library(progeny)
+library(ggrepel)
+```
+
+```{r}
+meta_list <- readRDS("../../../output/master_metadata.rds")
+sample_list <- names(meta_list)
+emp_programs <- readLines("../../../output/emp_program_list_broad.txt")
+emt_sig <- readLines("../../../output/conserved_emt_signature.txt")
+```
+
+
+
+# Fig 4B - Ligand count
+Data from nichenet.Rmd
+
+```{r}
+niche_res <- readRDS("../../../output/nichenet_res.rds")
+```
+
+Get top 10 ligands for each sample, count how often each ligand comes up
+```{r}
+good_ligands <- niche_res %>%
+  select(c("Sample", "pearson", "Gene")) %>%
+  unique() %>%
+  group_by(Sample) %>%
+  top_n(10, pearson) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Count = length(Sample)) %>%
+  arrange(desc(Count)) %>%
+  mutate(Rank = 1:nrow(.))
+good_ligands
+```
+
+
+```{r}
+normal12 <- c("#ebac23", #EMP
+              "#008cf9",#Cancer
+              "#b80058", #Fib
+              "#B24502", #Smooth muscle
+              "#00bbad", #Endo
+              "#d163e6", #Macro
+              "#FF9287", #Mono
+              "#006e00", #B
+              "#5954D6", #T
+              "#00C6F8", #NK
+              "#878500", #DC
+              "#00A76C", #Platelets
+              "#bdbdbd") #Unkown
+```
+
+
+```{r}
+good_ligands$Label <- ""
+good_ligands$Label[1:25] <- good_ligands$Gene[1:25]
+
+
+## Add color by highest expressing cell type
+niche_summary <- niche_res %>%
+  filter(Gene %in% unique(good_ligands$Gene)) %>%
+  group_by(CellType, Gene) %>%
+  summarise(Exp = mean(AvgExp, na.rm = T),
+            Pct = mean(pct, na.rm=T)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  filter(Exp == max(Exp))
+
+merge_dat <- left_join(good_ligands, niche_summary, by="Gene")
+merge_dat$CellType <- factor(merge_dat$CellType, 
+                             levels = c("Cancer cells_EMP", "Cancer cells", "Fibroblasts",
+                                        "Smooth_muscle_cells", "Endothelial_cells", 
+                                        "Macrophage", "Monocyte", "B_cell", 
+                                        "T_cells", "NK_cell", "DC", "Platelets", "Unknown"))
+
+
+ligand_freq_plot <- ggplot(merge_dat, aes(Rank, Count, label=Label)) +
+  geom_point(size=1, color="black") +
+  geom_text_repel(aes(color=CellType),
+                  max.overlaps = 1000,
+                  min.segment.length=0,
+                  direction="y",
+                  nudge_x=125,
+                  size=2.8,
+                  hjust=0,
+                  segment.size=0.2,
+                  segment.alpha=0.75,
+                  segment.color="black") +
+  xlab("Ligands ranked by frequency") + ylab("Number of tumours with\npredicted signalling") + 
+  scale_y_continuous(breaks=c(0,20, 40, 60, 80, 100), limits=c(0,100)) +
+  scale_color_manual(values=normal12,
+                     name="Highest expressing\ncell type") +
+  theme_classic() +
+  theme(axis.text = element_text(size=10, color="black"),
+        axis.title = element_text(size=12),
+        legend.key.size = unit(0.15, "cm"),
+        legend.text=element_text(size=10),
+        legend.title=element_text(size=12))
+
+ggsave(ligand_freq_plot, filename="nichenet_top_ligand_freq.pdf",
+       width=6, height=3, device=cairo_pdf())
+```
+
+
+# Fig 4C - Ligand dot plot
+```{r}
+ligands <- good_ligands$Gene[1:100]
+```
+
+
+```{r}
+niche_summary <- niche_res %>%
+  filter(Gene %in% ligands) %>%
+  group_by(CellType, Gene) %>%
+  summarise(Exp = mean(AvgExp, na.rm = T),
+            Pct = mean(pct, na.rm=T))
+```
+
+
+I'm going to make a dotplot, but I'd like the ligands/cell types to be ordered in a visually appealing way. I'll make a clustered heatmap, steal the order, and then use it on this
+```{r}
+niche_tmp <- niche_summary %>%
+  select(c("CellType", "Gene", "Exp")) %>%
+  pivot_wider(names_from="Gene", values_from="Exp")
+niche_mat <- as.matrix(niche_tmp[,2:ncol(niche_tmp)])
+rownames(niche_mat) <- niche_tmp$CellType
+
+niche_heat <- pheatmap::pheatmap(niche_mat,
+                                 silent=T,
+                                 clustering_method = "ward.D2")
+```
+
+
+```{r}
+#Aesthetic things
+niche_dot <- niche_summary
+niche_dot$Exp[niche_dot$Exp > 1] <- 1
+niche_dot$Pct[niche_dot$Pct > 0.75] <- 0.75
+niche_dot$Pct <- niche_dot$Pct * 100
+niche_dot$CellType <- factor(niche_dot$CellType,
+                             levels = rev(c("Cancer cells_EMP", "Cancer cells", "Fibroblasts",
+                                        "Smooth_muscle_cells", "Endothelial_cells", 
+                                        "Macrophage", "Monocyte", "B_cell", 
+                                        "T_cells", "NK_cell", "DC", "Platelets", "Unknown")))
+niche_dot$Gene <- factor(niche_dot$Gene,
+                             levels = colnames(niche_mat)[niche_heat$tree_col$order])
+
+#Plot
+dot <- ggplot(niche_dot, aes(x=Gene, y=CellType)) +
+  geom_point(aes(size = Pct, fill = Exp), alpha=0.8, color="black", shape=21) +
+  scale_size("% Exp", range = c(0,5)) +
+  scale_fill_gradientn(colours = viridisLite::inferno(100),
+                       limits = c(0,1),
+                       guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black"),
+                       name = "Avg Exp\nlog(TP10k)") +
+  ylab("") + xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size=9, angle=45, hjust=1, color="black"),
+        axis.text.y = element_text(size=12, color="black"))
+
+#Save
+ggsave(dot, filename="nichnet_dotplot.pdf",
+       device = cairo_pdf(),
+       width=18, height=4.25)
+```
+
+# Fig 4D - PCA of Progeny coeffients
+See emp_regulation.Rmd for the script that ran progeny on all the samples. Took a while and saved data into meta_list
+
+First, test each program for changes in pathways
+```{r}
+#pathways <- colnames(progeny_mat)
+pathways <- c("Androgen", "EGFR", "Estrogen", "Hypoxia", "JAK-STAT", "MAPK", "NFkB", "p53", "PI3K", "TGFb", "TNFa", "Trail", "VEGF", "WNT")
+
+testPathway <- function(pathway, program, df){
+  score_norm <- df[,program] / max(df[,program])
+  test_summary <- summary(lm(df[,pathway] ~ score_norm))
+  test_res <- data.frame(Coef = test_summary$coefficients[2,1],
+                         pval = test_summary$coefficients[2,4],
+                         Pathway = pathway)
+  return(test_res)
+}
+
+runPathwayTests <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  df <- meta_list[[sampleID]]
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  
+  pathway_test_res <- list()
+  for(i in 1:length(total_arch)){
+    test_summary <- lapply(pathways, testPathway, program = total_arch[i], df = df)
+    test_summary <- do.call("rbind", test_summary)
+    test_summary$padj <- p.adjust(test_summary$pval, method="BH")
+    test_summary$Program <- paste0(sampleID, "_", total_arch[i])
+    pathway_test_res[[i]] <- test_summary
+  }
+  
+  pathway_test_res <- do.call("rbind", pathway_test_res)
+}
+```
+
+```{r}
+pathway_scores <- lapply(sample_list, runPathwayTests)
+pathway_scores <- do.call("rbind", pathway_scores)
+```
+
+Build coefficient matrix
+
+```{r}
+pathway_coef <- pathway_scores
+pathway_coef$padj <- NULL
+pathway_coef$pval <- NULL
+pathway_coef <- pivot_wider(pathway_coef, names_from=Pathway, values_from=Coef)
+pathway_coef <- as.data.frame(pathway_coef)
+rownames(pathway_coef) <- pathway_coef$Program
+pathway_coef$Program <- NULL
+pathway_coef <- as.matrix(pathway_coef)
+```
+
+## KUL01 example
+### Arch program PCA
+```{r}
+seurat <- readRDS("../../../data/pan_cancer_epi.rds")
+```
+
+```{r}
+sampleID <- "Colorectal_Lee_KUL01"
+cells <- rownames(meta_list[[sampleID]])
+seurat_subset <- subset(seurat, cells = cells)
+seurat_subset <- SCTransform(seurat_subset, vars.to.regress="percent.mito")
+seurat_subset <- RunPCA(seurat_subset, verbose=F)
+
+dat <- meta_list[[sampleID]]
+dat$PC1 <- Embeddings(seurat_subset, "pca")[,1]
+dat$PC2 <- Embeddings(seurat_subset, "pca")[,2]
+dat$A1 <- dat$A1 / max(dat$A1)
+dat$A2 <- dat$A2 / max(dat$A2)
+dat$A3 <- dat$A3 / max(dat$A3)
+dat$A4 <- dat$A4 / max(dat$A4)
+```
+
+```{r}
+df <- dat %>%
+  select(PC1, PC2, A1, A2, A3, A4) %>%
+  pivot_longer(cols = -c(PC1, PC2),
+               names_to = "Program",
+               values_to = "Score")
+```
+
+```{r}
+pca_programs <- ggplot(df, aes(PC1, PC2)) +
+  geom_point(size=0.5, shape=16, aes(color=Score)) +
+  scale_color_gradientn(colors=viridis::mako(100), #colours = c("lightgrey", "red"),
+                        name="Program\nscore",
+                        guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black",
+                                              barwidth=0.75)) +
+  facet_wrap(~Program, ncol =4) +
+  theme_bw() +
+  theme(axis.text=element_blank(),#element_text(size=10, color="black"),
+        axis.title=element_blank(),#element_text(size=12),
+        axis.ticks=element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.title=element_text(size=12),
+        legend.text=element_text(size=12),
+        strip.background = element_blank(),
+        strip.text = element_text(size=12, color="black"),
+        panel.border = element_rect(size=0.5))
+pca_programs
+
+pca_programs <- ggplot(df, aes(PC1, PC2)) +
+  geom_point(size=0.5, shape=16, aes(color=Score)) +
+  scale_color_gradientn(colors=viridis::mako(100), #colours = c("lightgrey", "red"),
+                        name="Program\nscore",
+                        guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black",
+                                              barwidth=0.75)) +
+  facet_wrap(~Program, ncol =4) +
+  theme_void() +
+  theme(legend.title=element_text(size=12),
+        legend.text=element_text(size=12),
+        strip.background = element_blank(),
+        strip.text = element_text(size=12, color="black"))
+pca_programs
+```
+
+```{r}
+ggsave(pca_programs, filename="kul01_program_pca.pdf",
+       width=6.5, height=2, device=cairo_pdf())
+```
+
+
+### Signalling activity
+```{r}
+kul01_programs <- unique(grep("KUL01", pathway_scores$Program, value=T))
+coef_kul01 <- pathway_coef[kul01_programs,]
+rownames(coef_kul01) <- c("A1", "A2", "A3", "A4")
+```
+
+```{r}
+pheatmap::pheatmap(coef_kul01,
+                   border_color = "black",
+                   color = colorRampPalette(rev(RColorBrewer::brewer.pal(7, "RdBu")))(100),
+                   clustering_method="ward.D2",
+                   cluster_rows=F,
+                   treeheight_col = 0,
+                   #angle_col = 45,
+                   legend=F,
+                   filename="kul01_progeny_heatmap_horizontal.png",
+                   width=3, height=1.65, dpi=600)
+```
+
+### TNFa
+```{r}
+df <- meta_list[["Colorectal_Lee_KUL01"]]
+df$A2 <- df$A2 / max(df$A2)
+tnfa_plot <- ggplot(df, aes(x=A2, y=TNFa)) +
+  geom_point(shape=16, size=0.5, color="firebrick") +
+  geom_smooth(color="black") +
+  ggtitle("KUL01 - TNFa activity") +
+  xlab("A2 (EMP) score") + ylab("TNFa activity") +
+  theme_classic() +
+  theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=12))
+
+ggsave(tnfa_plot, filename="kul01_tnf.pdf",
+       width=2.75, height=2.15, device=cairo_pdf())
+```
+
+
+## PCA of signalling coefficients
+```{r}
+pca_res <- prcomp(pathway_coef, scale=F)
+```
+
+## Colored by cancer, but only EMP programs
+Factoextra provides some nice plotting functionality w/ ggplot2. I think I'll just use its plots
+
+```{r}
+program_list <- data.frame(Program = rownames(pathway_coef),
+                           EMP = ifelse(rownames(pathway_coef) %in% emp_programs, "EMP", "Other"),
+                           Cancer = gsub("_.*$", "", rownames(pathway_coef))) #remove all characters after the first underscore
+program_list <- arrange(program_list, desc(EMP))
+program_list$Cancer[which(program_list$EMP == "Other")] <- "Z"
+cols <- c("#ebac23", "#b80058", "#008cf9", "#006e00", "#00bbad", "#d163e6", "#b24502", "#ff9287", "lightgrey")
+
+pca_res$x <- pca_res$x[program_list$Program,]
+```
+
+
+```{r}
+pca1 <- fviz_pca_biplot(pca_res, geom.ind="point", axes=c(1,2),
+                col.ind = program_list$Cancer, col.var = "black",
+                repel=T, ggtheme = theme_classic(),
+                pointshape = 19, pointsize=1.2, title="PCA of all model coefficients") + #oversize points -- remove stroke in Designer
+  scale_color_manual(values=cols) +
+  guides(colour = guide_legend(override.aes = list(size=4))) +
+  theme(axis.text=element_text(size=12, colour='black'),
+        axis.title=element_text(size=12),
+        legend.text=element_text(size=12))
+
+ggsave(pca1, filename="progeny_pca_cancer.pdf", device=cairo_pdf(),
+       width=6, height=4)
+
+pca1
+```
+
+
+# Fig 4D - MAPK / Hypoxia difference
+
+Will make use of PCA results from Fig 4A above
+
+## PCA component
+```{r}
+mapk_programs <- rownames(pca_res$x)[rownames(pca_res$x) %in% emp_programs &
+                                       pca_res$x[,2] < -1 &
+                                       pca_res$x[,1] > 0]
+#mapk_programs <- substr(mapk_programs, 1, nchar(mapk_programs)-3) %>% unique()
+
+stat_programs <- rownames(pca_res$x)[rownames(pca_res$x) %in% emp_programs &
+                                       pca_res$x[,2] > 1 &
+                                       pca_res$x[,1] > 0]
+#stat_programs <- substr(stat_programs, 1, nchar(stat_programs)-3) %>% unique()
+```
+
+```{r}
+program_list$Group <- "Z"
+program_list$Group[program_list$Program %in% mapk_programs] <- "MAPK"
+program_list$Group[program_list$Program %in% stat_programs] <- "STAT"
+
+cols <- RColorBrewer::brewer.pal(3, "Dark2")
+cols[3] <- "lightgrey"
+```
+
+
+```{r}
+pca1 <- fviz_pca_biplot(pca_res, geom.ind="point", axes=c(1,2),
+                col.ind = program_list$Group, col.var = "black",
+                repel=T, ggtheme = theme_classic(),
+                pointshape = 19, pointsize=1.2) + #oversize points -- remove stroke in Designer
+  scale_color_manual(values=cols) +
+  guides(colour = guide_legend(override.aes = list(size=4))) +
+  theme(axis.text=element_text(size=10, colour='black'),
+        axis.title=element_text(size=12),
+        legend.position="none")
+
+ggsave(pca1, filename="progeny_mapk_stat.pdf", device=cairo_pdf(),
+       width=4.25, height=4)
+
+pca1
+```
+
+## Compare ligands
+```{r}
+mapk_programs <- rownames(pca_res$x)[rownames(pca_res$x) %in% emp_programs &
+                                       pca_res$x[,2] < -1 &
+                                       pca_res$x[,1] > 0]
+mapk_programs <- substr(mapk_programs, 1, nchar(mapk_programs)-3) %>% unique()
+
+stat_programs <- rownames(pca_res$x)[rownames(pca_res$x) %in% emp_programs &
+                                       pca_res$x[,2] > 1 &
+                                       pca_res$x[,1] > 0]
+stat_programs <- substr(stat_programs, 1, nchar(stat_programs)-3) %>% unique()
+```
+
+```{r}
+mapk_ligands <- niche_res %>%
+  filter(Sample %in% mapk_programs) %>%
+  select(c("Sample", "pearson", "Gene")) %>%
+  unique() %>%
+  group_by(Sample) %>%
+  top_n(20, pearson) %>% #results are actually a bit cleaner if you go with top 10
+  ungroup()
+
+
+
+mapk_ligand_count <- mapk_ligands %>% group_by(Gene) %>%
+  summarise(Count = length(Sample)) %>%
+  arrange(desc(Count)) %>%
+  mutate(Rank = 1:nrow(.))
+mapk_ligand_count$Count <- mapk_ligand_count$Count / length(mapk_programs)
+#The above line accounts for differences in the number of MAPK and STAT-associated programs. Convert to proportion
+
+
+stat_ligands <- niche_res %>%
+  filter(Sample %in% stat_programs) %>%
+  select(c("Sample", "pearson", "Gene")) %>%
+  unique() %>%
+  group_by(Sample) %>%
+  top_n(20, pearson) %>% #results are actually a bit cleaner if you go with top 10
+  ungroup()
+
+
+
+stat_ligand_count <- stat_ligands %>% group_by(Gene) %>%
+  summarise(Count = length(Sample)) %>%
+  arrange(desc(Count)) %>%
+  mutate(Rank = 1:nrow(.))
+stat_ligand_count$Count <- stat_ligand_count$Count / length(stat_programs) 
+```
+
+```{r}
+#common_ligands <- intersect(mapk_ligand_count, stat_ligand_count)
+
+
+
+```
+
+## Plot
+Add colour by cell type with highest expression maybe??
+```{r}
+merge_dat <- left_join(mapk_ligand_count, stat_ligand_count, by="Gene")
+merge_dat <- na.omit(merge_dat)
+merge_dat$CountDiff <- merge_dat$Count.x - merge_dat$Count.y #The difference in proportion
+merge_dat <- arrange(merge_dat, desc(CountDiff))
+merge_dat$Rank <- 1:nrow(merge_dat)
+
+
+mapk_ligands <- c(merge_dat %>% filter(CountDiff > 0.075) %>% pull(Gene)) 
+stat_ligands <- c(merge_dat %>% filter(CountDiff < -0.075) %>% pull(Gene))
+
+merge_dat$mapk_Label <- ""
+merge_dat$mapk_Label[match(mapk_ligands, merge_dat$Gene)] <- mapk_ligands
+
+merge_dat$stat_Label <- ""
+merge_dat$stat_Label[match(stat_ligands, merge_dat$Gene)] <- stat_ligands
+
+# Get expression info for ligands
+niche_summary <- niche_res %>%
+  filter(Gene %in% unique(merge_dat$Gene)) %>%
+  group_by(CellType, Gene) %>%
+  summarise(Exp = mean(AvgExp, na.rm = T),
+            Pct = mean(pct, na.rm=T)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  filter(Exp == max(Exp))
+
+merge_dat <- left_join(merge_dat, niche_summary, by="Gene")
+merge_dat$CellType <- factor(merge_dat$CellType, 
+                             levels = c("Cancer cells_EMP", "Cancer cells", "Fibroblasts",
+                                        "Smooth_muscle_cells", "Endothelial_cells", 
+                                        "Macrophage", "Monocyte", "B_cell", 
+                                        "T_cells", "NK_cell", "DC", "Platelets", "Unknown"))
+
+# Plot
+diff_plot <- ggplot(merge_dat, aes(x=Rank, y=CountDiff)) +
+  geom_point(aes(fill=CellType, size=Exp), colour="black", shape=21, alpha=0.6) +
+  geom_hline(yintercept = c(-0.075, 0.075), linetype=2) +
+  geom_text_repel(aes(label = mapk_Label, color=CellType),
+                  nudge_x = 50,
+                  direction = "y",
+                  force=0.5,
+                  ylim = c(0.075,NA),
+                  hjust= 0,
+                  size=3,
+                  segment.size = 0.2,
+                  segment.color="black") +
+  geom_text_repel(aes(label = stat_Label, color=CellType),
+                  nudge_x = -70,
+                  force=1,
+                  direction = "y",
+                  ylim = c(NA,-0.075),
+                  hjust= 1,
+                  size=2.75,
+                  segment.size = 0.2,
+                  segment.color="black") +
+  scale_y_continuous(expand = c(0, 0), breaks=c(-0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3), limits=c(-0.3, 0.3)) +
+  scale_fill_manual(values = normal12,
+                    name="Highest expressing\ncell type") +
+  scale_colour_manual(values = normal12,
+                    name="Highest expressing\ncell type") +
+  guides(colour = guide_legend(override.aes = list(size=4))) +
+  ylab("Difference in frequency (MAPK - Hypoxia)") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_text(size=14, colour="black"),
+        axis.title.y = element_text(size=14),
+        legend.text = element_text(size=14, color="black"),
+        legend.title = element_text(size=14))
+
+ggsave(diff_plot, filename="mapk_hypoxia_ligands.pdf",
+       width=6, height=6, device=cairo_pdf())
+
+diff_plot
+```
+
+```{r}
+
+```
+

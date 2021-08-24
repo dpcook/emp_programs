@@ -1,0 +1,336 @@
+---
+title: "Fig2 Panels"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggrastr)
+options(ggrastr.default.dpi=600)
+library(GeneOverlap)
+library(ggrepel)
+library(cowplot)
+```
+
+# Load common data
+```{r}
+seurat <- readRDS("../../../data/pan_cancer_epi.rds")
+meta_list <- readRDS("../../../output/master_metadata.rds")
+program_scores <- read.csv("../../../output/archetype_program_scores.csv")
+emt_programs <- readLines("../../../output/emp_program_list_broad.txt")
+```
+
+# Fig 2A - Number of programs per gene
+```{r}
+gene_counts <- program_scores %>%
+  filter(Program %in% emt_programs & padj <= 0.05 & coef > 1) %>%
+  group_by(Gene) %>%
+  summarise(Count = n(), avg_coef = mean(coef)) %>% 
+  arrange(desc(Count))
+gene_counts$Rank <- 1:nrow(gene_counts)
+```
+
+```{r}
+gene_counts
+```
+
+```{r}
+gene_counts$Sig <- ifelse(gene_counts$Count >= 20, "Sig", "Other")
+```
+
+
+```{r}
+count_plot <- ggplot(gene_counts, aes(x=Rank, y=Count)) +
+  geom_point(size=1, aes(color=Sig)) +
+  geom_hline(yintercept=20, linetype=2, size=1) +
+  xlab("Gene rank") + ylab("Number of programs") +
+  scale_color_manual(values=c("grey10", "firebrick")) +
+  scale_x_continuous(limits=c(1,4187), breaks=c(1000, 2000, 3000, 4000)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=14),
+        legend.position="none")
+count_plot
+```
+
+```{r}
+ggsave(count_plot, filename="dge_count.pdf",
+       width=3.2, height=2.5)
+```
+
+
+
+```{r}
+emt_sig <- gene_counts %>%
+  filter(Count >= 20) %>%
+  pull(Gene)
+emt_sig <- emt_sig[-grep("^MT-", emt_sig)]
+length(emt_sig)
+```
+
+# Fig 2B - Gene counts
+```{r}
+gene_counts_up <- program_scores %>%
+  filter(Program %in% emt_arch_broad & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef > 1) %>%
+  group_by(Gene) %>%
+  summarise(Count_Up = length(Program)) %>%
+  arrange(desc(Count_Up))
+
+
+gene_counts_down<- program_scores %>%
+  filter(Program %in% emt_arch_broad  & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef < -1) %>%
+  group_by(Gene) %>%
+  summarise(Count_Down = length(Program)) %>%
+  arrange(desc(Count_Down))
+
+gene_counts <- left_join(gene_counts_up, gene_counts_down,
+                         by="Gene")
+gene_counts$Count_Down[is.na(gene_counts$Count_Down)] <- 0
+gene_counts <- arrange(gene_counts, desc(Count_Down))
+gene_counts$Rank <- 1:nrow(gene_counts)
+```
+
+```{r}
+gene_counts$Sig <- ifelse(gene_counts$Count_Down <= 10, "Sig", "Other")
+```
+
+```{r}
+labels <- c("ITGA2", "JUN", "SOX4", "KLF6", "CD55", "NFKBIA",
+            "TIMP1", "IL32", "CEACAM5",
+            "VEGFA", "ITGB1", "PMEPA1", "ITGB4", "CXCL1", "FN1")
+```
+
+```{r}
+gene_counts$Label <- ""
+gene_counts$Label[which(gene_counts$Gene %in% labels)] <- gene_counts$Gene[which(gene_counts$Gene %in% labels)]
+gene_counts <- filter(gene_counts, Gene %in% emt_sig) # Only plot those that have already passed EMT sig
+
+count_plot <- ggplot(gene_counts, aes(x=Count_Down, y=Rank, label=Label)) +
+  geom_point(size=1, aes(color=Sig)) +
+  geom_vline(xintercept=11, linetype=2, size=0.5) +
+  geom_text_repel(colour="black",
+                  max.overlaps = Inf,
+                  min.segment.length=0.1,
+                  direction="y",
+                  nudge_x = 13,
+                  #force=10,
+                  size=2.5,
+                  hjust=0,
+                  segment.size=0.2,
+                  segment.color="black") +
+  ylab("Gene rank") + xlab("Number of programs") +
+  scale_color_manual(values=c("grey10", "firebrick")) +
+  scale_y_continuous(limits=c(1,476), breaks=c(100, 200, 300, 400)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=14),
+        legend.position="none")
+
+ggsave(count_plot, filename="dge_count_downregulated.pdf",
+       width=3.2, height=2.5)
+
+
+count_plot
+```
+
+```{r}
+emt_sig <- gene_counts %>%
+  filter(Sig == "Sig") %>%
+  pull(Gene)
+length(emt_sig)
+emt_sig
+```
+
+# Fig 2C - GO Terms
+```{r}
+go <- fgsea::gmtPathways("~/Data/GeneLists/GOTerms.BP.v6.1.symbols.gmt")
+```
+
+```{r}
+enrichmentTest <- function(gene_set){
+  go_object <- newGeneOverlap(emt_sig, gene_set,
+                              spec = "hg19.gene")
+  go_object <- testGeneOverlap(go_object)
+  results <- go_object@pval
+}
+
+enrichment <- lapply(go, enrichmentTest)
+enrichment <- as.data.frame(do.call("rbind", enrichment))
+colnames(enrichment) <- "pval"
+enrichment$padj <- p.adjust(enrichment$pval, method = "BH")
+```
+
+```{r}
+table(enrichment$padj <= 0.05)
+```
+
+```{r}
+enrichment$Term <- rownames(enrichment)
+```
+
+```{r}
+enrichment$Term <- gsub("GO_", "", enrichment$Term)
+enrichment$Term <- gsub("_", " ", enrichment$Term)
+enrichment$Term <- Hmisc::capitalize(tolower(enrichment$Term))
+```
+
+```{r}
+enrichment %>% arrange(padj) %>% head(300)
+```
+
+```{r}
+plot_terms <- c("Biological adhesion", "Negative regulation of cell death",
+                "Response to wounding", "Locomotion", "Wound healing",
+                "Epithelium development", "Response to cytokine", "Vasculature development",
+                "Extracellular structure organization", "Immune system process",
+                "Regulation of cell proliferation")
+
+plot_dat <- filter(enrichment, Term %in% plot_terms) %>% arrange(padj)
+plot_dat$Term <- factor(plot_dat$Term, levels=plot_dat$Term)
+
+enrichment_plot <- ggplot(plot_dat, aes(x=-log10(padj), y=Term)) +
+  geom_col(width=0.025, color="grey20", fill="grey20") +
+  geom_point(size=5, shape=21, color="black", aes(fill=-log10(padj))) +
+  geom_vline(xintercept=-log10(0.05), linetype=2) +
+  scale_fill_gradientn(colours=viridis::inferno(100), limits=c(0,max(-log10(plot_dat$padj)))) +
+  scale_x_continuous(expand=c(0,0), limits=c(0, max(-log10(plot_dat$padj)+1))) +
+  xlab("-log10(p-value)") + ylab("") + ggtitle("GO Terms enriched in\nEMP signature") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12),
+        legend.position="none")
+```
+
+```{r}
+ggsave(enrichment_plot, device=cairo_pdf(),
+       filename="emt_sig_go.pdf",
+       width=4.75, height=2.8)
+```
+
+# Fig 2D - Sample Genes
+## Coef hist
+
+```{r}
+cols <- rev(RColorBrewer::brewer.pal(7, "RdBu"))
+
+getVolcano <- function(gene){
+  dat <- program_scores %>%
+    filter(Gene == gene & Program %in% emt_programs)
+  dat$Sig <- "No"
+  dat$Sig[dat$padj <= 0.05 & dat$coef > 1] <- "Up"
+  dat$Sig[dat$padj <= 0.05 & dat$coef < -1] <- "Down"
+  
+  coef_hist <- ggplot(dat, aes(x=coef, y=-log10(padj))) +
+    geom_point(aes(color=Sig), shape=16, size=0.75) +
+    geom_vline(xintercept=c(-1, 1), linetype=2, size=0.5) +
+    geom_hline(yintercept=c(-log10(0.05)), linetype=2, size=0.5) +
+    scale_color_manual(values=c(cols[1], "grey20", cols[7])) +
+    ggtitle(gene) +
+    xlab("EMP model coefficient") + ylab("-log10(p-value)") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=14, color="black", face="italic"),
+          legend.position="none")
+  return(coef_hist)
+}
+
+itgb4 <- getVolcano("ITGB4")
+sox4 <- getVolcano("SOX4")
+vegfa <- getVolcano("VEGFA")
+fn1 <- getVolcano("FN1")
+```
+
+## Exp plot
+```{r}
+getExpPlot <- function(gene){
+  program <- program_scores %>%
+    filter(Program %in% emt_programs &
+             Gene == gene)
+  program <- program$Program[which(program$padj == min(program$padj))]
+
+    
+  sampleID <- substr(program, 1, nchar(program)-3)
+  arch <- substr(program, nchar(program)-1, nchar(program))
+  
+  meta <- meta_list[[sampleID]]
+  meta[,gene] <- seurat[["RNA"]]@data[gene, rownames(meta)]
+  meta[,arch] <- meta[,arch] / max(meta[,arch])
+  
+  print(paste0(gene, ": ", sampleID))
+  
+  exp_plot <- ggplot(meta, aes_string(arch, gene)) +
+    geom_point(size=0.1, colour="firebrick", alpha=0.5) +
+    geom_smooth(color="black") +
+    ggtitle(gsub("_", " - ", sampleID)) +
+    scale_x_continuous(breaks=c(0,0.5,1)) +
+    ylab("log(TP10k+1)") + xlab("EMP program activity") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=10))
+  exp_plot
+}
+
+itgb4_exp <- getExpPlot("ITGB4")
+sox4_exp <- getExpPlot("SOX4")
+vegfa_exp <- getExpPlot("VEGFA")
+fn1_exp<- getExpPlot("FN1")
+```
+
+```{r}
+full_plot <- plot_grid(itgb4, sox4, vegfa, fn1,
+                       itgb4_exp, sox4_exp, vegfa_exp, fn1_exp,
+                       ncol=4, align="hv")
+```
+
+```{r}
+save_plot(full_plot,
+          filename="sample_genes.pdf",
+          base_height=4.5, base_width=10)
+```
+
+# Fig 2E - Pan-cancer UMAP
+
+```{r}
+dat <- seurat@meta.data
+dat$UMAP1 <- Embeddings(seurat, 'umap')[,1]
+dat$UMAP2 <- Embeddings(seurat, 'umap')[,2]
+```
+
+```{r}
+sig_plot <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point_rast(size=0.01, shape=16, alpha=0.75, aes(color=EMT_Sig)) +
+  scale_colour_gradientn(colours=viridis::mako(100),
+                         name="EMT signature\nAUCell score",
+                         guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black",
+                                              barwidth=0.75)) +
+  theme_void() +
+  theme(legend.title = element_text(size=12),
+        legend.text=element_text(size=10))
+ #scale_colour_gradientn(colours=RColorBrewer::brewer.pal(7, "BuGn")) +
+  #theme(legend.position="none") #will do manual. Values range 0-1.25
+sig_plot
+```
+
+```{r}
+ggsave(sig_plot, filename="pan_cancer_emt_sig_umap.pdf", 
+       width=4.25, height=3.25)
+```
+
+
+
+
+
+
+
+
+
+
+
+

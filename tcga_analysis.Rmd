@@ -1,0 +1,378 @@
+---
+title: "EMP - TCGA Analysis"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(survival)
+library(survminer)
+```
+
+
+# Load and process data
+## Gene expression (RNA-seq)
+```{r}
+rna_seq <- read.delim("~/Data/TCGA_resources/EBPlusPlusAdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv", sep="\t")
+colnames(rna_seq)[2:ncol(rna_seq)] <- substr(colnames(rna_seq)[2:ncol(rna_seq)], 1, 12)
+colnames(rna_seq) <- make.unique(colnames(rna_seq)) #couple duplicated ones
+
+gene_id <- data.frame(gene = rna_seq$gene_id)
+gene_id <- separate(gene_id, col=gene, into=c("Symbol", "ID"))
+gene_id$Symbol[1:29] <- 1:29 #Blank entries
+
+rownames(rna_seq) <- make.unique(gene_id$Symbol)
+rna_seq$gene_id <- NULL
+
+rna_seq <- as.matrix(rna_seq)
+```
+
+These RSEM values for each sample have been quartile normalized to 1000 previously, so no need to CPM
+
+```{r}
+#several NAs that we'll just convert to 0
+rna_seq[is.na(rna_seq)] <- 0
+```
+
+## PFS data
+```{r}
+clinical <- read.csv("~/Data/TCGA_resources/Pan_TCGA_PFS_ClinicalDataResource.csv")
+clinical$bcr_patient_barcode <- gsub("-", ".", clinical$bcr_patient_barcode)
+clinical$bcr_patient_barcode <- make.unique(clinical$bcr_patient_barcode)
+```
+
+## Tumour stage
+```{r}
+clinical_all <- read.delim("~/Data/TCGA_resources/clinical_PANCAN_patient_with_followup.tsv",
+                           sep="\t")
+clinical_all$bcr_patient_barcode <- gsub("-", ".", clinical_all$bcr_patient_barcode)
+clinical_all$bcr_patient_barcode <- make.unique(clinical_all$bcr_patient_barcode)
+```
+
+Stage stored in pathologic_stage column OR clinical_stage column (annoying)
+
+```{r}
+clinical_stage <- select(clinical_all, c("bcr_patient_barcode", "pathologic_stage",
+                                       "clinical_stage"))
+```
+
+
+The pathologic_stage is the more complete column, but for some cancers (eg. OV), stage info is only in "clinical_stage"
+
+I'll just write some awkard code to deal with this
+
+```{r}
+stage_i <- c("Stage 0", "Stage I", "Stage IA", "Stage IB", "Stage IS")
+stage_ii <- c("Stage II", "Stage IIA", "Stage IIB", "Stage IIC")
+stage_iii <- c("Stage III", "Stage IIIA", "Stage IIIC", "Stage IIIB")
+stage_iv <- c("Stage IV", "Stage IVA", "Stage IVB", "Stage IVC")
+
+stages_keep <- c(stage_i, stage_ii, stage_iii, stage_iv)
+```
+
+```{r}
+clinical_stage$pathologic_check <- clinical_stage$pathologic_stage %in% stages_keep
+clinical_stage$clinical_check <- clinical_stage$clinical_stage %in% stages_keep
+
+df1 <- clinical_stage %>% filter(pathologic_check == T)
+df2 <- clinical_stage %>% filter(pathologic_check == F & clinical_check == T)
+
+clinical_stage <- data.frame(bcr_patient_barcode = c(df1$bcr_patient_barcode,
+                                                   df2$bcr_patient_barcode),
+                           Stage_Full = c(df1$pathologic_stage,
+                                          df2$clinical_stage))
+table(clinical_stage$Stage_Full)
+```
+
+
+Will have to group stages together. Let's first see if we can do I, II, III, and IV
+
+
+```{r}
+clinical_stage$Stage[clinical_stage$Stage_Full %in% stage_i] <- "Stage I"
+clinical_stage$Stage[clinical_stage$Stage_Full %in% stage_ii] <- "Stage II"
+clinical_stage$Stage[clinical_stage$Stage_Full %in% stage_iii] <- "Stage III"
+clinical_stage$Stage[clinical_stage$Stage_Full %in% stage_iv] <- "Stage IV"
+```
+
+```{r}
+table(clinical_stage$Stage)
+```
+
+Just in case we're underpowered to do it by all 4 stages (might be the case), let's do low (I & II) vs. high (III & IV)
+
+```{r}
+clinical_stage$Stage_Broad <- ifelse(clinical_stage$Stage %in% c("Stage I", "Stage II"),
+                                   "StageLow", "StageHigh")
+```
+
+
+
+## Tumor purity
+```{r}
+purity <- read.csv("~/Data/TCGA_resources/TumourPurityEstimates_Aran_NatComms.csv")
+```
+
+```{r}
+colnames(purity) <- c("bcr_patient_barcode", "type", "purity")
+```
+
+```{r}
+purity$bcr_patient_barcode <- substr(purity$bcr_patient_barcode, 1, 12)
+purity$bcr_patient_barcode <- gsub("-", ".", purity$bcr_patient_barcode)
+purity$bcr_patient_barcode <- make.unique(purity$bcr_patient_barcode)
+```
+
+Don't want to work with samples with unknown purity
+```{r}
+purity <- na.omit(purity)
+```
+
+## Immune cell proportion
+```{r}
+immune <- read.csv("~/Data/TCGA_resources/pan_cancer_immune_landscape.csv")
+immune$TCGA.Participant.Barcode <- gsub("-", ".", immune$TCGA.Participant.Barcode)
+```
+
+
+# Find common samples
+```{r}
+sample_list <- Reduce(intersect, list(purity$bcr_patient_barcode,
+                                      clinical_stage$bcr_patient_barcode,
+                                      clinical$bcr_patient_barcode,
+                                      colnames(rna_seq)))
+```
+
+```{r}
+length(sample_list)
+```
+
+Let's just see the breakdown by tumor type
+```{r}
+purity %>% filter(bcr_patient_barcode %in% sample_list) %>%
+  pull(type) %>% table()
+```
+
+ACC = Adrenocortical Carcinoma
+BLCA = Bladder Urothelial Carcinoma
+BRCA = Breast cancer
+CESC = Cervical Squamous Cell Carcinoma
+COAD = Colorectal adenocarcinoma
+GBM = Glioblastoma
+HNSC = Head and neck squamous cell carcinoma
+KICH = Kidney chromophone (Renal non-clear cell carcinoma)
+KIRC = Renal clear cell carcinoma
+KIRP = Renal papillary cell carcinoma
+LGG = Brain lower grade glioma
+LIHC = Liver Hepatocellular Carcinoma
+LUAD = Lung adenocarcinoma
+LUSC = Lung squamous cell carcinoma
+OV = High-grade serous ovarian cancer
+PRAD = Prostate adenocarcinoma
+READ = Rectal adenocarcinoma
+SKCM = Skin cutaneous melanoma
+THCA = Thyroid carcinoma
+UCEC = Uterine corpus endometrial carcionma
+UCS = Uterina carcinosarcoma
+
+# Merge relevant clinical data
+```{r}
+clinical_final <- data.frame(
+  bcr_patient_barcode = sample_list,
+  PFS.time = as.numeric(clinical$PFS.time)[match(sample_list, clinical$bcr_patient_barcode)],
+  PFS = clinical$PFS[match(sample_list, clinical$bcr_patient_barcode)] == 1,
+  Age = as.numeric(clinical_all$age_at_initial_pathologic_diagnosis[match(sample_list, clinical_all$bcr_patient_barcode)]),
+  Stage = clinical_stage$Stage[match(sample_list, clinical_stage$bcr_patient_barcode)],
+  Stage_Broad = clinical_stage$Stage_Broad[match(sample_list, clinical_stage$bcr_patient_barcode)],
+  Purity = purity$purity[match(sample_list, purity$bcr_patient_barcode)],
+  Type = purity$type[match(sample_list, purity$bcr_patient_barcode)]
+)
+
+clinical_final <- na.omit(clinical_final) #some PFS times are missing
+
+sample_list <- clinical_final$bcr_patient_barcode
+```
+
+
+# EMP scoring
+```{r}
+emt_sig <- readLines("~/Projects/emt_programs/output/emp_sig_refined_revised.txt")
+emt_sig <- emt_sig[emt_sig %in% rownames(rna_seq)]
+```
+
+```{r}
+exp_mat <- rna_seq[emt_sig, sample_list]
+exp_mat <- log2(exp_mat+1)
+exp_mat <- t(scale(t(exp_mat)))
+emp_score <- colMeans(exp_mat)
+```
+
+```{r}
+clinical_final$EMP <- scales::rescale(emp_score, to = c(0,1))
+```
+
+
+# Test survival
+
+```{r}
+coxph(Surv(PFS.time, PFS)~EMP + Type + Age + Purity + Stage_Broad, data=clinical_final)
+```
+
+```{r}
+write.csv(clinical_final, file="../output/tcga_clinical_emp.csv", row.names = F)
+```
+
+# Test each cancer
+```{r}
+testCancer <- function(cancer){
+  dat <- subset(clinical_final, Type == cancer)
+  res <- coxph(Surv(PFS.time, PFS)~EMP + Age + Purity + Stage_Broad, data=dat)
+  return(res)
+}
+cancer_list <- unique(clinical_final$Type)
+
+tmp <- lapply(cancer_list, testCancer)
+names(tmp) <- cancer_list
+tmp
+```
+
+# LUAD Kaplan Meier
+
+```{r}
+luad <- filter(clinical_final, Type == "LUAD")
+luad$EMP_binary <- ifelse(luad$EMP > median(luad$EMP),
+                          "High", "Low")
+sfit <- survfit(Surv(PFS.time, PFS)~EMP_binary, data=luad)
+```
+
+```{r}
+ggsurvplot(sfit, conf.int=F, pval=TRUE, 
+           legend.labs=c("High", "Low"), legend.title="EMP",  
+           palette=c("firebrick", "grey50"), 
+           title="LUAD - EMP high vs. low")
+```
+
+# Immune cell proportion
+```{r}
+immune_proportions <- immune[,c(1,2,3,
+                                37:58)]
+immune_proportions <- na.omit(immune_proportions)
+common_samples <- intersect(immune_proportions$TCGA.Participant.Barcode,
+                            colnames(rna_seq))
+immune_proportions <- filter(immune_proportions,
+                             TCGA.Participant.Barcode %in% common_samples)
+```
+
+```{r}
+exp_mat <- rna_seq[emt_sig, common_samples]
+exp_mat[exp_mat < 0] <- 0 #some are very slightly negative??
+exp_mat <- log1p(exp_mat)
+exp_mat <- t(scale(t(exp_mat)))
+immune_proportions$EMP_Score <- colMeans(exp_mat[,immune_proportions$TCGA.Participant.Barcode])
+```
+
+```{r}
+write.csv(immune_proportions, file="../output/tcga_immune_composition_emp.csv",
+          row.names = F)
+```
+
+
+```{r}
+testEMP <- function(cell_type){
+  score <- immune_proportions[,cell_type]
+  
+  model_res <- summary(lm(score ~ immune_proportions$EMP_Score + immune_proportions$TCGA.Study))
+  res <- data.frame(Coef = model_res$coefficients[2,1],
+                    pval = model_res$coefficients[2,4],
+                    CellType = cell_type)
+}
+```
+
+```{r}
+cell_type_list <- colnames(immune_proportions)[4:25]
+```
+
+```{r}
+cell_type_list
+```
+
+```{r}
+#Can log transform proportions to make them a little more normally distributed
+immune_proportions[,cell_type_list] <- log(immune_proportions[,cell_type_list] + 0.01)
+
+prop_res <- lapply(cell_type_list, testEMP)
+prop_res <- do.call("rbind", prop_res)
+prop_res$padj <- p.adjust(prop_res$pval, method="BH")
+
+#order
+prop_res <- prop_res %>%
+  arrange(Coef)
+prop_res$CellType <- factor(prop_res$CellType, levels=prop_res$CellType)
+prop_res$Sig <- ifelse(prop_res$padj <= 0.05, "Sig", "Not Sig")
+```
+
+```{r}
+celltype_plot <- ggplot(prop_res, aes(x=Coef, y = CellType)) +
+  geom_point(aes(size=-log10(padj), fill=Sig), shape=21, color="black") +
+  geom_vline(xintercept = 0, linetype=2) +
+  scale_fill_manual(values=c('lightgrey', 'firebrick')) +
+  xlab("EMP Score Coefficient") + ylab("") +
+  theme_classic() +
+  theme(axis.text.y=element_text(size=12, color="black"),
+        axis.text.x=element_text(size=10, color="black"),
+        axis.title=element_text(size=12))
+celltype_plot
+```
+```{r}
+testCancer <- function(cancer_type){
+  df <- immune_proportions %>% filter(TCGA.Study == cancer_type)
+}
+```
+
+```{r}
+cell_type_list <- colnames(immune_proportions)[4:25]
+cancer_list <- unique(immune_proportions$TCGA.Study)
+
+testEMP <- function(cell_type, df){
+  score <- df[,cell_type]
+  
+  model_res <- summary(lm(score ~ df$EMP_Score))
+  res <- data.frame(Coef = model_res$coefficients[2,1],
+                    pval = model_res$coefficients[2,4],
+                    CellType = cell_type,
+                    Cancer = unique(df$TCGA.Study))
+}
+
+testCancer <- function(cancer_type){
+  print(paste0("Testing: ", cancer_type))
+  df <- immune_proportions %>% filter(TCGA.Study == cancer_type)
+  models <- lapply(cell_type_list, testEMP, df=df)
+  models <- do.call("rbind", models)
+  models$pval <- p.adjust(models$pval, method="fdr")
+  return(models)
+}
+```
+
+```{r}
+cancer_emp <- lapply(cancer_list, testCancer)
+```
+
+```{r}
+cancer_emp <- do.call("rbind", cancer_emp)
+cancer_emp$Sig <- ifelse(cancer_emp$pval <= 0.05, "Sig", "Not Sig")
+```
+
+```{r}
+celltype_plot <- ggplot(cancer_emp, aes(x=Coef, y = CellType)) +
+  geom_point(aes(size=-log10(pval), fill=Sig), shape=21, color="black") +
+  geom_vline(xintercept = 0, linetype=2) +
+  scale_fill_manual(values=c('lightgrey', 'firebrick')) +
+  xlab("EMP Score Coefficient") + ylab("") +
+  facet_wrap(~Cancer, ncol=5) +
+  theme_classic() +
+  theme(axis.text.y=element_text(size=12, color="black"),
+        axis.text.x=element_text(size=10, color="black"),
+        axis.title=element_text(size=12))
+
+ggsave(celltype_plot, filename="~/Downloads/cancer_props.pdf", width=20, height=20)
+```

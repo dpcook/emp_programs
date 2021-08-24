@@ -1,0 +1,347 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+# Goal
+Go through each tumour dataset and assess the specificity of each EMT signature gene to cancer cells (and specifically those associated with EMP programs). We'll use the genesorteR package for calculating a specificity score rather than just comparing Z-scores or log-transformed counts
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(pheatmap)
+library(genesorteR)
+```
+
+```{r}
+emt_sig <- readLines("~/Projects/emt_programs/output/conserved_emt_signature.txt")
+emt_programs <- readLines("~/Projects/emt_programs/output/emp_program_list_broad.txt")
+meta_list <- readRDS("~/Projects/emt_programs/output/master_metadata.rds")
+```
+
+Some organizing
+```{r}
+for(i in 1:length(meta_list)){
+  meta_list[[i]]$Program <- paste0(names(meta_list)[i], "_A", meta_list[[i]]$Archetype_Membership)
+}
+meta <- do.call("bind_rows", meta_list)
+meta$EMP_Program <- ifelse(meta$Program %in% emt_programs, "EMP", "") # See note below
+meta$CellBarcode <- rownames(meta)
+```
+
+# General function
+All seurat objects are organized in a consistent way to deal with this in a single function.
+
+Note: I have the opportunity to calculate the specificity score separately between non-EMP cancer cells and EMP cancer cells, though not 100% clear if it's relevant. If you do it, you do end up getting genes that are really good markers, but if you have a similar specificity score, it doesn't mean that the gene isn't expressed more in the EMP program. So depends on the question. If you want the most specific markers of EMP, do it. If you're just looking for something quantitatively associated with EMP, it's not necessarily the best. I've commented out the line that does that below.
+
+For now, I only really care about specificity in the epithelial component because the signature is going to be used for bulk RNA-seq data from tumours
+
+DAVID: Modify this function to split it by the individual samples within the data set. Function can return a named list.
+
+```{r}
+getSpecScore <- function(seurat){
+  dat <- seurat@meta.data
+  dat$CellBarcode <- rownames(dat)
+  
+  #tmp <- filter(meta, EMP_Program == "EMP")
+  #dat$CellType[dat$CellBarcode %in% tmp$CellBarcode] <- "Cancer cell - EMP"
+  
+  # Go sample by sample, calculating the specificity score
+  sample_list <- unique(dat$Patient)
+  sample_list <- sample_list[sample_list %in% names(meta_list)] #Only do ones included in the rest of the analysis
+  
+  spec_score_list <- list()
+  for(i in 1:length(sample_list)){
+    print(paste0("Checking sample: ", sample_list[i]))
+    cells_keep <- rownames(dat)[dat$Patient == sample_list[i]]
+    dat_subset <- dat[cells_keep,]
+    
+    #########
+    # Omit cell types with <10 cells. Can't calculate reliable specificity w/ so few cells
+    count_dat <- dat_subset %>% group_by(CellType) %>% summarise(count = n())
+    clusters_keep <- count_dat %>% filter(count >= 10) %>% pull(CellType)
+    dat_subset <- filter(dat_subset, CellType %in% clusters_keep)
+    cells_keep <- dat_subset$CellBarcode
+    #########
+    
+    #########
+    # In a few rare cases, only cancer cells remain so you can't calculate specificity
+    # Script will only proceed if there are other cell types to compare against
+    if(length(clusters_keep) > 1){
+      emt_sig_good <- emt_sig[emt_sig %in% rownames(seurat)]
+      spec_score <- sortGenes(seurat[["RNA"]]@data[emt_sig_good, cells_keep],
+                            dat_subset$CellType,
+                            binarizeMethod = "adaptiveMedian")
+      spec_mat <- as.matrix(spec_score$specScore)
+      colnames(spec_mat) <- levels(spec_score$inputClass)
+      spec_score_list[[i]] <- spec_mat
+    }
+    
+    
+  }
+  
+  names(spec_score_list) <- sample_list
+  
+  return(spec_score_list)
+}
+```
+
+# Colorectal - Lee - SMC
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_seurat.rds")
+seurat$Patient <- paste0("Colorectal_Lee_", seurat$Patient)
+colorectal_lee_smc <- getSpecScore(seurat)
+```
+
+# Colorectal - Lee - KUL
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_KUL_seurat.rds")
+seurat$Patient <- paste0("Colorectal_Lee_", seurat$Patient)
+colorectal_lee_kul <- getSpecScore(seurat)
+```
+
+# Colorectal Uhlitz
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Uhlitz_seurat.rds")
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste0("Colorectal_Uhlitz_", seurat$Patient)
+colorectal_uhlitz <- getSpecScore(seurat)
+```
+
+# Colorectal - Qian
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Qian_seurat.rds")
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste0("Colorectal_Qian_", seurat$Patient)
+colorectal_qian <- getSpecScore(seurat)
+```
+
+# Gastric - Sathe
+```{r}
+seurat <- readRDS("../output/tumour_annotations/gastric_sathe_seurat.rds")
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste0("Gastric_Sathe_", seurat$Patient)
+gastric_sathe <- getSpecScore(seurat)
+```
+
+# Lung Kim
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_kim_seurat.rds")
+seurat$Patient <- seurat$Sample
+seurat$Patient <- paste0("Lung_Kim_", seurat$Patient)
+lung_kim <- getSpecScore(seurat)
+```
+
+# Lung Lambrechts
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_lambrechts_seurat.rds")
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste0("Lung_Lambrechts_", seurat$Patient)
+lung_lambrechts <- getSpecScore(seurat)
+```
+
+# Lung Laughney
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_laughney_seurat.rds")
+seurat$Patient <- paste0("Lung_Laughney_", seurat$Patient)
+lung_laughney <- getSpecScore(seurat)
+```
+
+# Lung - Qian
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_qian_seurat.rds")
+seurat$Patient <- paste0("Lung_Qian_", seurat$Patient)
+qian_lung <- getSpecScore(seurat)
+```
+
+# Lung - Wu
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_wu_seurat.rds")
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste0("Lung_Wu_", seurat$Patient)
+lung_wu <- getSpecScore(seurat)
+```
+
+# Ovarian Geistlinger
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_geistlinger_seurat.rds")
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste0("Ovarian_Geistlinger_", seurat$Patient)
+ovarian_geistlinger <- getSpecScore(seurat)
+```
+
+# Ovarian - Qian
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_qian_seurat.rds")
+seurat$Patient <- paste0("Ovarian_Qian_", seurat$Patient)
+qian_ovarian <- getSpecScore(seurat)
+```
+
+# PDAC Steele
+```{r}
+seurat <- readRDS("../output/tumour_annotations/pdac_steele_seurat.rds")
+seurat$Patient <- gsub("PDAC_", "", seurat$Sample)
+seurat$Patient <- paste0("PDAC_Steele_", seurat$Patient)
+pdac_steele <- getSpecScore(seurat)
+```
+
+# Breast - Wu
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_wu_seurat.rds")
+seurat$Patient <- paste0("Breast_Wu_", seurat$Patient)
+breast_wu <- getSpecScore(seurat)
+```
+
+# Breast - Qian
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_qian_seurat.rds")
+seurat$Patient <- paste0("Breast_Qian_", seurat$Patient)
+qian_breast <- getSpecScore(seurat)
+```
+
+# Breast - Bassez Cohort 1
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort1_seurat.rds")
+seurat$Patient <- paste0("Breast_Bassez_", seurat$Patient)
+breast_bassez_cohort1 <- getSpecScore(seurat)
+```
+
+# Breast - Bassez Cohort 2
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort2_seurat.rds")
+seurat$Patient <- paste0("Breast_Bassez_", seurat$Patient)
+breast_bassez_cohort2 <- getSpecScore(seurat)
+```
+
+# SCC Ji
+```{r}
+seurat <- readRDS("../output/tumour_annotations/scc_ji_seurat.rds")
+seurat$Patient <- paste0("SCC_Ji_", seurat$Patient)
+scc_ji <- getSpecScore(seurat)
+```
+
+# NPC Chen
+```{r}
+seurat <- readRDS("../output/tumour_annotations/npc_chen_seurat.rds")
+seurat$Patient <- paste0("NPC_Chen_", seurat$Patient)
+npc_chen <- getSpecScore(seurat)
+```
+
+# Merge all
+```{r}
+spec_scores <- c(colorectal_lee_smc, colorectal_lee_kul, colorectal_uhlitz, colorectal_qian,
+                 gastric_sathe, 
+                 lung_kim, lung_laughney, lung_lambrechts, lung_wu, lung_kim, qian_lung, 
+                 pdac_steele,
+                 scc_ji, 
+                 breast_bassez_cohort1, breast_bassez_cohort2, breast_wu, qian_breast, 
+                 ovarian_geistlinger, qian_ovarian,
+                 npc_chen)
+```
+
+Get rid of any sample that was only cancer cells with nothing to compare to
+
+```{r}
+spec_scores <- spec_scores[names(meta_list)]
+spec_scores <- spec_scores[!unlist(lapply(spec_scores, is.null))] #removes Lung_Wu_P2
+```
+
+
+# Average across all tumours
+Want one matrix that's the average for all cell types. Easiest way I can think to do this is to make a tidy data frame
+```{r}
+for(i in 1:length(spec_scores)){
+  print(paste0("Wrangling: ", names(spec_scores)[i]))
+  spec_scores[[i]] <- as.data.frame(spec_scores[[i]])
+  spec_scores[[i]]$Gene <- rownames(spec_scores[[i]])
+  spec_scores[[i]] <- pivot_longer(spec_scores[[i]], 
+                                   cols = -Gene, 
+                                   names_to = "CellType",
+                                   values_to = "Specificity")
+  spec_scores[[i]]$Sample <- names(spec_scores)[i]
+}
+spec_scores <- do.call("bind_rows", spec_scores)
+```
+
+I could first calculate an average for each cancer type, and then average those again to normalize for sample count per cancer. For now, I'll just do a simple average though
+
+```{r}
+spec_score_avg <- spec_scores %>%
+  group_by(CellType, Gene) %>%
+  summarise(Avg_Specificity = mean(Specificity))
+```
+
+```{r}
+spec_score_avg <- pivot_wider(spec_score_avg, names_from="CellType", 
+                              values_from = "Avg_Specificity")
+spec_score_mat <- as.matrix(spec_score_avg[,2:ncol(spec_score_avg)])
+rownames(spec_score_mat) <- spec_score_avg$Gene
+spec_score_mat <- spec_score_mat[,c("Epithelial_cells",
+                                    "Fibroblasts",
+                                    "Smooth_muscle_cells",
+                                    "Endothelial_cells",
+                                    "Macrophage",
+                                    "Monocyte",
+                                    "B_cell",
+                                    "T_cells",
+                                    "NK_cell",
+                                    "DC",
+                                    "Unknown")]
+```
+
+```{r}
+spec_score_heat <- pheatmap::pheatmap(spec_score_mat,
+         color = viridis::inferno(100),
+         breaks = seq(0, 0.25, length.out=101),
+         border_color = "black",
+         cluster_cols=F,
+         cluster_rows=T,
+         clustering_method="ward.D",
+         cutree_rows=16,
+         show_rownames=T,
+         fontsize_row = 4,
+         filename = "../figs/emt_sig_avg_specificity.png",
+         width=3, height=15)
+```
+
+# Make refined signature of highly specific genes
+```{r}
+plot(spec_score_heat$gtable)
+```
+The top and bottom cluster here are pretty solidly specific to epithelial cells. Let's make a refined signature of just these genes
+
+
+
+
+```{r}
+clusters <- as.data.frame(cutree(spec_score_heat$tree_row, k=16))
+colnames(clusters) <- "Cluster"
+clusters$Gene <- rownames(clusters)
+table(clusters$Cluster)
+```
+
+Order from top to bottom
+```{r}
+unique(clusters$Cluster[spec_score_heat$tree_row$order])
+```
+
+```{r}
+refined_sig <- clusters %>% filter(Cluster %in% c(12, 16, 5, 14)) %>% pull(Gene)
+```
+
+Could maybe justify getting rid of cluster 14 due to sparse contamination from other cell types. Still pretty clearly more specific in epithelium
+
+```{r}
+refined_sig
+```
+
+```{r}
+writeLines(refined_sig, file("../output/emp_sig_refined_revised.txt"))
+```
+
+```{r}
+write.csv(spec_score_mat, file="../output/specificity_score_matrix.csv")
+```
+
+

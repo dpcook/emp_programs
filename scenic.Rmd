@@ -1,0 +1,710 @@
+---
+title: "TF activity for EMP programs"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(data.table)
+```
+
+# Load data
+The pan_cancer seurat and meta data list I used in the EMT programs paper will be useful here
+```{r}
+seurat <- readRDS("../data/pan_cancer_epi.rds")
+meta_list <- readRDS("../output/master_metadata.rds")
+sample_list <- names(meta_list)
+```
+
+Get file names from SCENIC's auc_mtx files
+```{r}
+files <- list.files("../output/scenic/")
+auc_files <- grep("auc_mtx", files, value=T)
+```
+
+The goal will be to read in all AUC matrices, combine this info with the archetype metadata, and then run a test for differential TF activity for EMP programs.
+
+So many of the TFs have multiple regulons. Originally I thought about taking an average, but they're not even close to being correlated with each other (the ones I checked have pearson coefficients around 0). Seems like averaging would messy up any patterns. I think my approach will be to keep them independent for now, run the statistics, and then if >1 regulon for a TF is significant, I'll take the average.
+
+Let's make a function that reads in all the AUC matrices and grabs the corresponding archetype info:
+
+```{r}
+getAUC <- function(sample_name){
+  print(sample_name)
+  regulon_names <- read.csv(paste0("../output/scenic/", sample_name, "_auc_mtx.csv"),
+                      row.names=1, header=F, nrows=1)
+  regulon_names <- as.character(regulon_names)
+  regulon_names <- gsub("(+)", "_Pos", regulon_names, fixed=T)
+  regulon_names <- gsub("(-)", "_Neg", regulon_names, fixed=T)
+  
+  auc_mat <- read.csv(paste0("../output/scenic/", sample_name, "_auc_mtx.csv"),
+                      row.names=1)
+  auc_mat <- as.matrix(auc_mat)
+  colnames(auc_mat) <- regulon_names
+  auc_mat <- auc_mat[,colMeans(auc_mat)!=0]
+  auc_mat <- scale(auc_mat) #Makes coefficients a bit more interpretable
+  
+  df <- meta_list[[sample_name]]
+  total_arch <- paste0("A", unique(df$Archetype_Membership))
+  total_arch <- total_arch[order(total_arch)]
+  df <- df[rownames(auc_mat),c("Archetype_Membership", total_arch)]
+  auc_mat <- cbind(df, auc_mat)
+  return(auc_mat)
+}
+```
+
+Run it
+```{r}
+tmp <- getAUC(sample_list[1])
+auc_dat <- lapply(sample_list, getAUC)
+names(auc_dat) <- sample_list
+
+
+#Now some functions to iterate through each auc table, identify the number of archetypes, and test each TF's activity as a function of #archetype score
+
+testPathway <- function(tf, program, df){
+  score_norm <- df[,program] / max(df[,program])
+  test_summary <- summary(lm(df[,tf] ~ score_norm))
+  test_res <- data.frame(Coef = test_summary$coefficients[2,1],
+                         pval = test_summary$coefficients[2,4],
+                         TF = tf)
+  return(test_res)
+}
+
+runTFTests <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  df <- auc_dat[[sampleID]]
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  
+  #All TFs 
+  tf_list <- colnames(df)[!colnames(df) %in% c("Archetype_Membership", total_arch)]
+  
+  tf_test_res <- list()
+  for(i in 1:length(total_arch)){
+    test_summary <- lapply(tf_list, testPathway, program = total_arch[i], df = df)
+    test_summary <- do.call("rbind", test_summary)
+    test_summary$padj <- p.adjust(test_summary$pval, method="BH")
+    test_summary$Program <- paste0(sampleID, "_", total_arch[i])
+    tf_test_res[[i]] <- test_summary
+  }
+  
+  tf_test_res <- do.call("rbind", tf_test_res)
+}
+
+
+tf_scores <- lapply(sample_list, runTFTests)
+tf_scores <- do.call("rbind", tf_scores)
+tf_scores$TF <- gsub("\\..*","", tf_scores$TF)
+
+write.csv(tf_scores, file="../output/tf_activity_scores.csv")
+```
+
+# Regulon count
+```{r}
+tf_scores <- read.csv("../output/tf_activity_scores.csv")
+```
+
+```{r}
+emp_programs <- readLines("~/Projects/emt_programs/output/emp_program_list_broad.txt")
+```
+
+```{r}
+tf_up <- filter(tf_scores, Program %in% emp_programs & padj <= 0.05 & Coef >1) %>%
+  group_by(TF) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+tf_up
+```
+
+```{r}
+tf_down <- filter(tf_scores, Program %in% emp_programs & padj <= 0.05 & Coef < -1) %>%
+  group_by(TF) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+tf_down
+```
+
+```{r}
+tf_diff <- left_join(tf_up, tf_down, suffix=c("_up", "_down"), by = "TF")
+tf_diff$Difference <- tf_diff$count_up - tf_diff$count_down
+tf_diff <- arrange(tf_diff, desc(Difference))
+
+tf_diff
+```
+
+```{r}
+ggplot(tf_diff, aes(x=count_up, y=count_down)) +
+  geom_point() +
+  theme_classic()
+```
+
+```{r}
+tf_up$Rank <- 1:nrow(tf_up)
+
+tf_up_plot <- ggplot(tf_up, aes(x=Rank, y=count)) +
+  geom_point() +
+  theme_classic()
+
+tf_up_plot
+```
+
+```{r}
+tf_sig <- 
+```
+
+
+# EMP programs
+```{r}
+tf_scores <- read.csv("../output/tf_activity_scores.csv")
+```
+
+```{r}
+emp_activity <- filter(tf_scores, Program %in% emp_programs &
+                         padj <= 0.05 & abs(Coef) >= 0.5)
+```
+I've messed around a little with the coefficient cutoff. If I look at the distribution of all coefficeints, 0.01 looks pretty appropriate.
+
+```{r}
+emp_tf_counts <- emp_activity %>%
+  group_by(TF) %>%
+  summarise(Count_Up = sum(Coef > 0),
+            Count_Down = sum(Coef < 0))
+emp_tf_counts$Count_Diff <- emp_tf_counts$Count_Up - emp_tf_counts$Count_Down
+
+emp_tf_counts %>% arrange(desc(Count_Diff))
+```
+Looks great!
+
+## Plot
+```{r}
+tf_labels <- c("KLF6_Pos", "KLF4_Pos", "JUNB_Pos", "SOX4_Pos", "NFKB2_Pos", "SMAD3_Pos", "STAT1_Pos", "KLF2_Pos", "CREB5_Pos", "BHLHE40_Pos",
+               "MAFF_Pos", "ATF3_Pos", "FOSB_Pos","IRF1_Pos",   #Up
+               "MYC_Pos", "MYBL2_Pos", "HES6_Pos", "KLF6_Neg", "RELB_Neg", "STAT1_Neg", "CDX2_Pos",
+               "IRF1_Neg", "HES1_Pos", "E2F1_Pos", "MYB_Pos") #Down
+```
+
+```{r}
+emp_tf_counts$Label <- ""
+emp_tf_counts$Label[match(tf_labels, emp_tf_counts$TF)] <- tf_labels
+```
+
+
+```{r}
+bluered <- rev(RColorBrewer::brewer.pal(9, "RdBu"))
+
+xy_plot <- ggplot(emp_tf_counts, aes(x=Count_Up, y=Count_Down, label=Label)) +
+  geom_point(size=2.5, shape=21, color="black", alpha=0.8, 
+             aes(fill=Count_Diff, size=abs(Count_Diff))) +
+  geom_abline(slope=1, intercept = 0, linetype=2) +
+  geom_text_repel(colour="black",
+                  max.overlaps = Inf,
+                  min.segment.length=0,
+                  direction="both",
+                  size=3,
+                  hjust=0,
+                  segment.size=0.5,
+                  segment.alpha=0.75,
+                  segment.color="black") +
+  xlab("Number of programs with increased activity") + ylab("Number of programs with decreased activity") +
+  ggtitle("TFs with differential activity") +
+  scale_fill_gradientn(colors = bluered,limits= c(-150,150),
+                       name="Difference") +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12))
+xy_plot
+```
+
+```{r}
+ggsave(xy_plot, filename="../figs/pan_cancer_regulon_EMP_difference.pdf",
+       useDingbats=F,
+       width=6, height=5)
+```
+
+
+# Importing GRNs and regulons
+The first step of SCENIC makes a first draft GRN based on co-expression patterns, regardless of evidence of direct regulation. Therefore, it will also include downstream effects of a TF. A second step of SCENIC is to prune the GRN to only contain TF-target relationships within the TF's regulon.
+
+GRNs are data frames in the format of TF, target, importance (random forest)
+Regulon files are in a very obscure file. I've grabbed a function from the Aerts lab to organize it
+
+```{r}
+dir <- "../output/scenic/"
+files <- paste0(dir, list.files("../output/scenic/"))
+```
+
+
+## GRNs
+```{r}
+grn_files <- grep("grn.tsv", files, value=T)
+grn_list_names <- substr(grn_files, 18, nchar(grn_files)-8)
+```
+
+```{r}
+grn_list <- lapply(grn_files, fread, sep="\t")
+```
+
+```{r}
+grn_list <- lapply(grn_list, as.data.frame)
+names(grn_list) <- grn_list_names
+```
+
+## Regulons
+```{r}
+regulon_files <- grep("regulons", files, value=T)
+regulon_list <- lapply(regulon_files, fread, sep="\t", skip=3)
+
+for(i in 1:length(regulon_list)){
+  colnames(regulon_list[[i]]) <- c("TF", "MotifID", "AUC", "Annotation", "Context", "MotifSimilarityQvalue",
+			                  "NES", "OrthologousIdentity", "RankAtMax", "TargetGenes")
+}
+
+regulon_list_names <- substr(regulon_files, 18, nchar(regulon_files)-13)
+```
+
+The regulon format is really silly and hard to parse. We'll simplify it here using a function written by the Aerts lab: https://github.com/aertslab/singlecellRNA_melanoma_paper/blob/master/Scripts/get_regulons_from_pyscenic_table.R
+
+The original function allows for positive and negative regulons and for simplicity, I've kept that here and just worked with it. It's a little jenky, but works
+```{r}
+getRegulon <- function(reg, tf, d) {  
+  #d: "neg"/"pos" 
+  digitpattern <- "[[:digit:]]+\\.[[:digit:]e-]+"
+  alltargets <- lapply(1:reg[TF == tf & dir == d, .N], function(i) {  
+    targets <- strsplit(  
+      gsub(digitpattern, "",  
+           gsub(" ", "",  
+                gsub("'", "",   
+                     gsub("]", "",  
+                          gsub("[", "",   
+                               gsub("[()]", "", reg[TF == tf & dir == d, TargetGenes][i]),   
+                               fixed = TRUE),   
+                          fixed = TRUE),  
+                )  
+           )  
+      )  
+      , ",")[[1]]  
+    targets[sapply(targets, function(p) {p != ""})]  
+  })  
+  Reduce(union, alltargets)  
+}
+```
+
+This is slooooww. Works well though.
+```{r}
+regulons <- list()
+for(i in 1:length(regulon_list)){
+  sample_regulons <- list()
+  regulon_list[[i]] <- regulon_list[[i]][, dir := ifelse(grepl("activating", Context), "pos", "neg")]
+  d <- "pos"
+  sample_regulons[[d]] <- sapply(unique(regulon_list[[i]][dir == d, TF]), function(tf) {  
+    getRegulon(regulon_list[[i]], tf, d)
+    })
+  
+  d <- "neg"
+  sample_regulons[[d]] <- sapply(unique(regulon_list[[i]][dir == d, TF]), function(tf) {  
+    getRegulon(regulon_list[[i]], tf, d)
+    })
+  
+  regulons[[i]] <- sample_regulons
+}
+
+names(regulons) <- regulon_list_names
+```
+
+```{r}
+saveRDS(regulons, file="../output/regulon_list.rds")
+```
+
+Oops, to be consistent, I'll use regulon_list as the variable name
+```{r}
+regulon_list <- readRDS("../output/regulon_list.rds")
+```
+
+
+## Convert into data frame for easy wrangling
+```{r}
+makeDF <- function(sample, direction, tf, reg_list){
+  df <- data.frame(sample=sample,
+                   direction=direction,
+                   tf=tf,
+                   target=reg_list[[sample]][[direction]][[tf]])
+  return(df)
+}
+
+convertRegulon <- function(sample){
+  print(paste0("Processing sample: ", sample))
+  #Do the positive regulons
+  tf_list <- names(regulon_list[[sample]][["pos"]])
+  for(i in 1:length(tf_list)){
+    regulon_list[[sample]][["pos"]][[i]] <- makeDF(sample, "pos", tf_list[i],
+                                                  reg_list = regulon_list)
+  }
+  
+  #Do the negative regulons
+  ##Note: there's at least sample with only 1 negative regulon, making it not a list--let's make it one. This is kind of weird to wrangle. Not ideal solution, but works with this
+  if(class(regulon_list[[sample]][["neg"]])[1]=="matrix"){
+    tf_name <- colnames(regulon_list[[sample]][["neg"]])
+    targets <- as.character(regulon_list[[sample]][["neg"]])
+    regulon_list[[sample]][["neg"]] <- list(targets)
+    names(regulon_list[[sample]][["neg"]]) <- tf_name
+  }
+  
+  tf_list <- names(regulon_list[[sample]][["neg"]])
+  for(i in 1:length(tf_list)){
+    regulon_list[[sample]][["neg"]][[i]] <- makeDF(sample, direction="neg", 
+                                                   tf=tf_list[i], reg_list = regulon_list)
+  }
+  #Merge each into a single DF
+  regulon_list[[sample]][["pos"]] <- do.call("rbind", regulon_list[[sample]][["pos"]])
+  regulon_list[[sample]][["neg"]] <- do.call("rbind", regulon_list[[sample]][["neg"]])
+  
+  #Combine (1 df per sample)
+  regulon_list[[sample]] <- do.call("rbind", regulon_list[[sample]])
+}
+```
+
+```{r}
+regulon_list <- lapply(regulon_list_names, convertRegulon)
+names(regulon_list) <- regulon_list_names
+```
+
+Add some columns that will help down the road. May not need all these, but they won't hurt
+```{r}
+for(i in 1:length(regulon_list)){
+  regulon_list[[i]]$regulon <- paste0(regulon_list[[i]]$tf, "_", regulon_list[[i]]$direction)
+  regulon_list[[i]]$tf_target <- paste0(regulon_list[[i]]$tf, "_", regulon_list[[i]]$target)
+  regulon_list[[i]]$regulon_target <- paste0(regulon_list[[i]]$regulon, "_", regulon_list[[i]]$target)
+}
+```
+
+
+```{r}
+saveRDS(regulon_list, file="../output/regulon_list_DFs.rds")
+```
+
+# Add directionality to GRN
+Easiest way to do this is to convert the regulon lists to data frames where I can do left_join or something
+
+```{r}
+regulon_list <- readRDS("../output/regulon_list_DFs.rds")
+```
+
+
+```{r}
+grnDirection <- function(sample){
+  grn_df <- grn_list[[sample]]
+  regulon_df <- regulon_list[[sample]]
+  colnames(regulon_df) <- c("Sample", "Direction", "TF", "target", "regulon", "tf_target", "regulon_target")
+  
+  grn_df$tf_target <- paste0(grn_df$TF, "_", grn_df$target)
+  grn_df <- left_join(grn_df, regulon_df, by="tf_target")
+  grn_df$TF <- grn_df$TF.x
+  grn_df$Target <- grn_df$target.x
+  grn_df[,c("TF.x", "TF.y", "target.x", "target.y")] <- NULL
+  
+  
+  grn_df <- na.omit(grn_df) # Remove GRN links that are not supported by a regulon
+  return(grn_df) 
+}
+```
+
+```{r}
+sample_list <- names(grn_list)
+grn_list <- lapply(names(grn_list), grnDirection)
+names(grn_list) <- sample_list
+```
+
+```{r}
+saveRDS(grn_list, file="../output/grn_list.rds")
+```
+
+# Exploring regulons
+So at this point, the regulons are relatively clean. SCENIC only kept regulons of a minimum size (I think default was 20ish). We can explore their structure a little bit to get an idea of what's going on.
+
+In the following two sections, I'll be calculating jaccard similarties, so I'll setup a basic function here that does it from a list of TF-target relationships.
+
+## Jaccard function
+
+
+```{r}
+makeList <- function(TF, df){
+  targets <- df %>% filter(regulon==TF) %>% pull(target)
+  return(targets)
+}
+
+getJaccard <- function(regulon, regulon_list){
+  jaccard_scores <- 0
+  for(i in 1:length(regulon_list)){
+    jaccard_scores[i] <- length(intersect(regulon_list[[regulon]], regulon_list[[i]])) / length(union(regulon_list[[regulon]], regulon_list[[i]]))
+  }
+  names(jaccard_scores) <- names(regulon_list)
+  return(jaccard_scores)
+}
+
+getJaccardAll <- function(sampleID){
+  regulons_df <- regulon_list[[sampleID]]
+  regulons_as_list <- lapply(unique(regulons_df$regulon), makeList, df=regulons_df)
+  names(regulons_as_list) <- unique(regulons_df$regulon)
+  
+  #jaccard
+  jaccard_mat <- lapply(unique(regulons_df$regulon), getJaccard, regulon_list=regulons_as_list)
+  jaccard_mat <- do.call("rbind", jaccard_mat)
+  rownames(jaccard_mat) <- colnames(jaccard_mat)
+  
+  return(jaccard_mat)
+}
+```
+
+## Intra-sample TF jaccard
+The interest here is to see what type of overlap exists between regulons. This can give some insight into modularity that we'll hopefully see in the GRN, but 
+
+```{r}
+jaccard_mat <- lapply(names(regulon_list), getJaccardAll)
+names(jaccard_mat) <- names(regulon_list)
+```
+
+```{r}
+pheatmap(jaccard_mat[[1]],
+         color=viridis::inferno(100),
+         cluster_rows=T, cluster_cols=T,
+         show_colnames=F,
+         border_color="black",
+         clustering_method="ward.D2",
+         file="~/Downloads/jaccard_test.png",
+         width=15, height=15)
+```
+
+Don't really know what to do with this. It's pretty heavily influenced by regulon size.
+
+```{r}
+table(regulon_list[[1]]$regulon)[order(table(regulon_list[[1]]$regulon))]
+```
+
+
+## Inter-sample individual TF jaccard
+How consistent is a TF's regulon across samples?
+
+```{r}
+regulon_list_merge <- do.call("rbind", regulon_list)
+all_regulons <- unique(regulon_list_merge$regulon)
+```
+
+
+```{r}
+sampleJaccard <- function(reg){
+  print(paste0("Testing: ", reg))
+  df <- filter(regulon_list_merge, regulon==reg)
+  sample_list <- unique(df$sample)
+  
+  tf_regulons <- list()
+  for(i in 1:length(sample_list)){
+    tf_regulons[[i]] <- df %>%
+      filter(sample == sample_list[i]) %>%
+      pull(target)
+  }
+  names(tf_regulons) <- sample_list
+  
+  jaccard_scores <- lapply(sample_list, getJaccard, regulon_list=tf_regulons)
+  jaccard_scores <- do.call("rbind", jaccard_scores)
+  rownames(jaccard_scores) <- colnames(jaccard_scores)
+  return(jaccard_scores)
+}
+```
+
+```{r}
+jaccard_tf <- lapply(all_regulons, sampleJaccard)
+names(jaccard_tf) <- all_regulons
+```
+
+At the moment, there's not much to do here, but I think it could be useful
+
+# Cleaning GRNs
+So now maybe we can start looking into the GRNs a little bit
+
+```{r}
+grn_list <- readRDS("../output/grn_list.rds")
+```
+
+# Test
+```{r}
+library(ggraph)
+library(igraph)
+```
+
+```{r}
+df <- grn_list[[17]]
+```
+
+```{r}
+table(df$TF)[order(table(df$TF))]
+```
+
+
+
+```{r}
+hist(df$importance, breaks=100)
+abline(v=quantile(df$importance, probs=0.5))
+```
+
+```{r}
+df <- filter(df, importance >= quantile(df$importance, probs=0.9))
+```
+
+```{r}
+table(df$TF)[order(table(df$TF))]
+```
+
+```{r}
+tf_keep <- df %>%
+  group_by(TF) %>%
+  summarise(Count = n()) %>%
+  filter(Count >= 10) %>%
+  pull(TF)
+
+df <- filter(df, TF %in% tf_keep)
+```
+
+```{r}
+tfs <- df %>%
+  distinct(TF) %>% 
+  rename(Gene = TF)
+targets <- df %>%
+  distinct(Target) %>%
+  rename(Gene = Target)
+nodes <- full_join(tfs, targets, by="Gene") %>%
+  rowid_to_column("id")
+
+edges <- df %>%
+  left_join(nodes, by=c("TF" = "Gene")) %>%
+  rename(from=id)
+edges <- edges %>%
+  left_join(nodes, by = c("Target" = "Gene")) %>%
+  rename(to=id)
+edges <- select(edges, from, to, importance, Direction)
+
+
+net_graph <- tbl_graph(nodes=nodes, edges=edges, directed=T)
+net_graph <- net_graph %>% activate(nodes) %>%
+  mutate(TF = ifelse(Gene %in% df$TF, "Factor", "Other"),
+         CellCycle = ifelse(Gene %in% cc.genes.updated.2019$s.genes | Gene %in% cc.genes.updated.2019$g2m.genes,
+                            "CellCycle", "Other"),
+         EMT = ifelse(Gene %in% emt_genes, "EMP", "Other"))
+```
+
+```{r}
+ggraph(net_graph, layout = 'fr') +
+  geom_edge_link(aes(width=log1p(importance), alpha=log1p(importance), color=Direction)) +
+  geom_node_point(aes(color=CellCycle)) +
+  scale_edge_width(range = c(0.05, 0.4)) +
+  scale_size(range=c(0.1, 4)) # Node size 
+```
+
+# Test 2
+```{r}
+tmp <- do.call("rbind", grn_list)
+importance_cutoff <- median(tmp$importance)
+```
+
+```{r}
+tmp2 <- tmp %>% group_by(regulon_target) %>% summarise(count = n())
+```
+Interesting >1e6 links that only occur in <=2 samples
+
+```{r}
+plot(table(factor(tmp2$count)))
+```
+
+I feel like you could get a cleaner, more unified GRN by pruning away:
+1) Rare targets
+2) Rare TFs
+3) low log1p(importance) connections. Maybe only keep top 50th percentile (confirmed that the sample-to-sample differences in the distributions aren't really different, so you can define one threshold)
+4) Rare TF-target relationships
+
+## Filter targets
+
+```{r}
+tmp %>% distinct(Sample, Target) %>%
+  group_by(Target) %>%
+  summarise(Count=n()) %>%
+  arrange(Count) %>%
+  pull(Count) %>%
+  plot
+abline(h=25)
+```
+```{r}
+targets_keep <- tmp %>% distinct(Sample, Target) %>%
+  group_by(Target) %>%
+  summarise(Count=n()) %>%
+  filter(Count >= 25) %>%
+  pull(Target)
+```
+
+## Filter TFs
+```{r}
+tmp %>% distinct(Sample, regulon) %>%
+  group_by(regulon) %>%
+  summarise(Count=n()) %>%
+  arrange(Count) %>%
+  pull(Count) %>%
+  plot
+abline(h=c(15))
+```
+
+```{r}
+tf_keep <- tmp %>% distinct(Sample, regulon) %>%
+  group_by(regulon) %>%
+  summarise(Count=n()) %>%
+  filter(Count >= 15) %>%
+  pull(regulon)
+```
+
+## Importance filtering
+Because I want to capture the full distribution of importances values when setting the cutoff, I don't want to fitler out the TFs/Targets first
+
+```{r}
+hist(log1p(tmp$importance), breaks=100)
+abline(v=median(log1p(tmp$importance)))
+```
+Now apply the three filters
+```{r}
+df <- tmp %>% 
+  filter(importance >= median(tmp$importance)) %>%
+  filter(Target %in% targets_keep & regulon %in% tf_keep)
+```
+
+## Filter rare TF-target links
+
+```{r}
+df %>% group_by(regulon_target) %>%
+  summarise(Count=n()) %>%
+  arrange(Count) %>%
+  pull(Count) %>%
+  plot
+abline(h=5)
+```
+
+```{r}
+link_keep <- df %>% distinct(Sample, regulon_target) %>%
+  group_by(regulon_target) %>%
+  summarise(Count=n()) %>%
+  filter(Count >= 5) %>%
+  pull(regulon_target)
+```
+
+```{r}
+df_summary <- filter(df, regulon_target %in% link_keep)
+```
+
+```{r}
+df_summary <- df_summary %>%
+  group_by(TF, Target, Direction) %>%
+  summarise(Count=n(),
+            Avg_Importance = mean(importance))
+```
+
+

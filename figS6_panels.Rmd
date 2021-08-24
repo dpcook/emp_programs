@@ -1,0 +1,114 @@
+---
+title: "Figure S6 - EMP Signature Scores"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(matrixStats)
+```
+
+# Load the data
+```{r}
+null.list <- read.csv("../../../output/gene_set_null_permutations.csv", row.names=1)
+null.list <- as.matrix(null.list)
+
+seurat <- readRDS("../../../data/pan_cancer_epi.rds")
+```
+
+# Distribution of EMP score w/ null
+```{r}
+df <- seurat@meta.data
+df$Null <- rowMeans(null.list)
+df <- df %>%
+  select(c("EMT_Sig", "Cancer", "SampleID", "Null", "Source")) %>%
+  pivot_longer(cols = -c("Cancer", "Source", "SampleID"),
+               values_to = "Score",
+               names_to = "Group")
+df$Group <- factor(df$Group, levels=c("Null", "EMT_Sig"))
+```
+
+```{r}
+cols <- RColorBrewer::brewer.pal(7, "Dark2")
+
+plot_dist <- function(cancer){
+  df <- filter(df, Cancer == cancer)
+  cancer_emp <- ggplot(df, aes(x=SampleID, y=Score)) +
+    geom_boxplot(aes(fill=Source, color=Group), alpha=0.75, outlier.size = 0) +
+    scale_fill_manual(values=c(cols[1:length(unique(df$Source))]),
+                      name="Study") +
+    scale_color_manual(values=c("red", "black"), labels = c("Null", "EMP Sig"),
+                       name="") +
+    xlab("") + ylab("EMP Signature Score") + ggtitle(cancer) +
+    #facet_wrap(~Source, scales="free") +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.y = element_text(size=12, color="black"),
+          axis.title.y = element_text(size=14))
+  return(cancer_emp)
+}
+```
+
+```{r}
+colorectal <- plot_dist("Colorectal")
+gastric <- plot_dist("Gastric")
+lung <- plot_dist("Lung")
+ovarian <- plot_dist("Ovarian")
+pdac <- plot_dist("PDAC")
+breast <- plot_dist("Breast")
+scc <- plot_dist("SCC")
+npc <- plot_dist("NPC")
+```
+
+
+```{r}
+top_row <- cowplot::plot_grid(lung)
+second_row <- cowplot::plot_grid(breast, gastric, rel_widths = c(4.5,1), ncol=2)
+third_row <- cowplot::plot_grid(colorectal, ovarian, rel_widths = c(3,1), ncol=2)
+bottom_row <- cowplot::plot_grid(gastric, npc, pdac, scc,
+                                 rel_widths = c(1, 1.2, 1.5, 1), ncol=4)
+```
+
+```{r}
+all_plots <- cowplot::plot_grid(top_row, second_row, third_row, bottom_row, ncol=1)
+```
+
+```{r}
+cowplot::save_plot(all_plots,
+                   filename="emt_score_dist.pdf",
+                   base_width=15 , base_height=10)
+```
+
+# Variance comparison
+```{r}
+null_vars <- data.frame(Var = colVars(null.list),
+                        Statistic = "Var")
+sig_vars <- seurat@meta.data %>%
+  group_by(Cancer, SampleID) %>%
+  summarise(Var = var(EMT_Sig)) %>%
+  mutate(Statistic = "Var")
+```
+
+```{r}
+var_plot <- ggplot(null_vars, aes(y=Statistic, x=Var)) +
+  geom_jitter(color="black") +
+  geom_jitter(data=sig_vars, aes(color=Cancer)) +
+  scale_x_continuous(limits=c(0, max(sig_vars$Var) + 0.001), expand=c(0,0)) +
+  ylab("") + xlab("Sample score variance") +
+  theme_classic() +
+  theme(axis.text.x=element_text(size=12, color="black"),
+        axis.title.x=element_text(size=14),
+        axis.text.y=element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.key.size = unit(0.15, "cm"),
+        legend.text=element_text(size=12),
+        legend.title=element_text(size=14))
+var_plot
+```
+```{r}
+ggsave(var_plot, filename="variance_comparison.pdf",
+       width=5, height=2.2)
+```
+

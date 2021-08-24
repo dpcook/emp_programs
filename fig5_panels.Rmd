@@ -1,0 +1,120 @@
+---
+title: "Figure S7 - SCENIC"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggrepel)
+```
+
+# Load data
+```{r}
+tf_scores <- read.csv("../../../output/tf_activity_scores.csv", row.names=1)
+emp_programs <- readLines("../../../output/emp_program_list_broad.txt")
+```
+
+# Regulon count
+
+```{r}
+tf_up <- filter(tf_scores, Program %in% emp_programs & padj <= 0.05 & Coef >1) %>%
+  group_by(TF) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count))
+tf_up$Rank <- 1:nrow(tf_up)
+tf_up
+```
+
+```{r}
+tf_up$Sig <- ifelse(tf_up$Count >= 20, "Sig", "Other")
+```
+
+
+```{r}
+count_plot <- ggplot(tf_up, aes(x=Rank, y=Count)) +
+  geom_point(size=1, aes(color=Sig)) +
+  geom_hline(yintercept=20, linetype=2, size=1) +
+  xlab("Gene rank") + ylab("Number of programs") +
+  scale_color_manual(values=c("grey10", "firebrick")) +
+  #scale_x_continuous(limits=c(1,1200), breaks=c(1000, 2000, 3000, 4000)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=14),
+        legend.position="none")
+count_plot
+```
+
+# Regulon count
+
+```{r}
+emp_activity <- filter(tf_scores, Program %in% emp_programs &
+                         padj <= 0.05 & abs(Coef) >= 0.5)
+```
+I've messed around a little with the coefficient cutoff. If I look at the distribution of all coefficeints, 0.01 looks pretty appropriate.
+
+```{r}
+emp_tf_counts <- emp_activity %>%
+  group_by(TF) %>%
+  summarise(Count_Up = sum(Coef > 0),
+            Count_Down = sum(Coef < 0))
+emp_tf_counts$Count_Diff <- emp_tf_counts$Count_Up - emp_tf_counts$Count_Down
+
+emp_tf_counts %>% arrange(desc(Count_Diff))
+```
+
+## Plot
+```{r}
+tf_labels <- c("KLF6_Pos", "KLF4_Pos", "JUNB_Pos", "SOX4_Pos", "NFKB2_Pos", "SMAD3_Pos", "STAT1_Pos", "KLF2_Pos", "CREB5_Pos", "BHLHE40_Pos",
+               "MAFF_Pos", "ATF3_Pos", "FOSB_Pos","IRF1_Pos",   #Up
+               "MYC_Pos", "MYBL2_Pos", "HES6_Pos", "KLF6_Neg", "RELB_Neg", "STAT1_Neg", "CDX2_Pos",
+               "IRF1_Neg", "HES1_Pos", "E2F1_Pos", "MYB_Pos") #Down
+```
+
+```{r}
+emp_tf_counts$Label <- ""
+emp_tf_counts$Label[match(tf_labels, emp_tf_counts$TF)] <- tf_labels
+```
+
+
+```{r}
+bluered <- rev(RColorBrewer::brewer.pal(9, "RdBu"))
+
+xy_plot <- ggplot(emp_tf_counts, aes(x=Count_Up, y=Count_Down, label=Label)) +
+  geom_point(size=2.5, shape=21, color="black", alpha=0.8, 
+             aes(fill=Count_Diff, size=abs(Count_Diff))) +
+  geom_abline(slope=1, intercept = 0, linetype=2) +
+  geom_text_repel(colour="black",
+                  max.overlaps = Inf,
+                  min.segment.length=0,
+                  direction="both",
+                  size=3,
+                  hjust=0,
+                  segment.size=0.5,
+                  segment.alpha=0.75,
+                  segment.color="black") +
+  xlab("Number of programs with increased activity") + ylab("Number of programs with decreased activity") +
+  ggtitle("TFs with differential activity") +
+  scale_fill_gradientn(colors = bluered,limits= c(-150,150),
+                       name="Difference",
+                       guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black",
+                                              barwidth=0.75)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=12))
+xy_plot
+```
+
+```{r}
+ggsave(xy_plot, filename="pan_cancer_regulon_EMP_difference.pdf",
+       useDingbats=F,
+       width=6, height=5)
+```
+
+
+
+
+
+
+

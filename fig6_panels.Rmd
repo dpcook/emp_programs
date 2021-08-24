@@ -1,0 +1,394 @@
+---
+title: "Figure 5 Panels"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(factoextra)
+library(progeny)
+library(ggridges)
+library(cowplot)
+library(ggforce)
+```
+
+# Load data
+```{r}
+seurat <- readRDS("~/Data/single_cell_datasets/mix_seq/output/seurat_processed.rds")
+meta_list <- readRDS(file="../../../output/master_metadata_mixseq.rds")
+program_scores <- read.csv("../../../output/archetype_program_scores_mixseq.csv")
+drug_sensitivity <- read.csv("../../../output/mixseq_emp_drug_sensitivity.csv", row.names=1)
+summary_mat <- drug_sensitivity[,c("Drug", "Program", "Estimate")]
+```
+
+```{r}
+summary_mat <- pivot_wider(summary_mat, names_from = Program, values_from = Estimate)
+```
+
+```{r}
+drug_names <- summary_mat$Drug
+summary_mat <- as.matrix(summary_mat[,2:ncol(summary_mat)])
+rownames(summary_mat) <- drug_names
+```
+
+```{r}
+seurat$CellLine_Full <- seurat$singlet_ID
+```
+
+```{r}
+seurat@meta.data <- separate(seurat@meta.data, singlet_ID, into = c("CellLine", "Cancer"),
+                             extra="merge")
+```
+
+# Fig 5A - PROGENy PCA w/ Trametinib effect sizes
+## Test pathways
+```{r}
+#pathways <- colnames(progeny_mat)
+sample_list <- names(meta_list)
+pathways <- c("Androgen", "EGFR", "Estrogen", "Hypoxia", "JAK-STAT", "MAPK", "NFkB", "p53", "PI3K", "TGFb", "TNFa", "Trail", "VEGF", "WNT")
+
+testPathway <- function(pathway, program, df){
+  score_norm <- df[,program] / max(df[,program])
+  test_summary <- summary(lm(df[,pathway] ~ score_norm))
+  test_res <- data.frame(Coef = test_summary$coefficients[2,1],
+                         pval = test_summary$coefficients[2,4],
+                         Pathway = pathway)
+  return(test_res)
+}
+
+runPathwayTests <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  df <- meta_list[[sampleID]]
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  
+  pathway_test_res <- list()
+  for(i in 1:length(total_arch)){
+    test_summary <- lapply(pathways, testPathway, program = total_arch[i], df = df)
+    test_summary <- do.call("rbind", test_summary)
+    test_summary$padj <- p.adjust(test_summary$pval, method="BH")
+    test_summary$Program <- paste0(sampleID, "_", total_arch[i])
+    pathway_test_res[[i]] <- test_summary
+  }
+  
+  pathway_test_res <- do.call("rbind", pathway_test_res)
+}
+```
+
+```{r}
+pathway_scores <- lapply(sample_list, runPathwayTests)
+pathway_scores <- do.call("rbind", pathway_scores)
+```
+
+## PCA of coefficients
+```{r}
+pathway_coef <- pathway_scores
+pathway_coef$padj <- NULL
+pathway_coef$pval <- NULL
+pathway_coef <- pivot_wider(pathway_coef, names_from=Pathway, values_from=Coef)
+pathway_coef <- as.data.frame(pathway_coef)
+rownames(pathway_coef) <- pathway_coef$Program
+pathway_coef$Program <- NULL
+pathway_coef <- as.matrix(pathway_coef)
+rownames(pathway_coef) <- make.names(rownames(pathway_coef))
+```
+
+```{r}
+pca_res <- prcomp(pathway_coef, scale=F)
+```
+
+## Trametinib sensitivity
+
+```{r}
+tram_sensitivity <- drug_sensitivity %>%
+  filter(Drug == "Trametinib")
+tram_effect <- tram_sensitivity[match(rownames(pathway_coef), tram_sensitivity$Program), "Estimate"]
+
+tram_effect[tram_effect < -0.15] <- -0.15
+tram_effect[tram_effect > 0.15] <- 0.15
+```
+
+Re-order to make sure values get put on top
+```{r}
+tram_order <- rev(order(tram_effect))
+pca_res$x <- pca_res$x[tram_order,]
+```
+
+
+```{r}
+pca1 <- fviz_pca_biplot(pca_res, geom.ind="point", axes=c(1,2),
+                col.ind = tram_effect[tram_order], repel=T, col.var = "black",
+                ggtheme = theme_classic(),
+                pointshape = 16, pointsize=2, title="MIX-seq: EMP-associated signalling")  +
+  scale_color_gradientn(colours=colorRampPalette(rev(brewer.pal(7, "RdBu")))(100),
+                        name="Trametinib effect\non EMP",
+                        guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black",
+                                              barwidth=0.75)) +
+  theme(axis.text=element_text(size=10, colour='black'),
+        axis.title=element_text(size=12),
+        legend.text=element_text(size=12))
+
+ggsave(pca1, filename="trametinib_sensitivity_pca.pdf", device=cairo_pdf(),
+       width=4.5, height=3)
+
+pca1
+```
+
+
+# Fig 5B - Boxplot of EMP
+
+Look at trametinib effects. The Drug sensitivity data frame is only on EMP programs, so no need to subset it for EMP programs
+```{r}
+drug_sensitivity %>% 
+  filter(Drug == "Trametinib") %>% 
+  arrange(desc(Estimate))
+```
+Get genes associated with programs we choose from above 
+```{r}
+getGenes <- function(program){
+  hits <- program_scores %>% filter(Program == program &
+                                padj <= 0.05 &
+                                coef >= 0.25) %>%
+    pull(Gene)
+}
+
+loximvi_genes <- getGenes("LOXIMVI_A5")
+msto211h_genes <- getGenes("MSTO211H_A6")
+malme3m_genes <- getGenes("MALME3M_A6")
+hec1b_genes <- getGenes("HEC1B_A3")
+```
+
+Set up scoring function
+```{r}
+scoreCells <- function(cell_line, gene_set){
+  seurat_subset <- subset(seurat, 
+                          subset = CellLine == cell_line & 
+                            Drug %in% c("Trametinib", "Untreated", "DMSO"))
+  seurat_subset <- AddModuleScore_UCell(seurat_subset, features = list(EMP_Sig=gene_set),
+                                  name = "")
+  return(seurat_subset@meta.data)
+}
+```
+
+```{r}
+loximvi <- scoreCells("LOXIMVI", loximvi_genes)
+loximvi$Drug <- factor(loximvi$Drug, levels=c("DMSO", "Trametinib"))
+
+msto211h <- scoreCells("MSTO211H", msto211h_genes)
+msto211h$Drug <- factor(msto211h$Drug, levels=c("DMSO", "Trametinib"))
+
+malme3m <- scoreCells("MALME3M", malme3m_genes)
+malme3m$Drug <- factor(malme3m$Drug, levels=c("DMSO", "Trametinib"))
+
+hec1b <- scoreCells("HEC1B", hec1b_genes)
+hec1b$Drug <- factor(hec1b$Drug, levels=c("DMSO", "Trametinib"))
+```
+
+Plot
+```{r}
+plotSample <- function(dat, colour){
+  dat_plot <- ggplot(dat, aes(Drug, EMP_Sig)) +
+    geom_sina(aes(color=Drug), alpha=0.75, shape=16, size=1) +
+    stat_summary(fun.y="mean",geom="crossbar", width=0.5) +
+    scale_color_manual(values = c("grey", colour)) +
+    ylab("EMP UCell") + xlab("") +
+    ggtitle(paste0(unique(dat$CellLine),
+                   " - ",
+                   Hmisc::capitalize(tolower(unique(dat$Cancer))))) +
+    theme_classic() +
+    theme(legend.position="none",
+          axis.text.x=element_text(size=12, angle=45, hjust=1, color="black"),
+          axis.text.y=element_text(size=10, color="black"),
+          axis.title = element_text(size=12),
+          plot.title = element_text(size=10, color="black"))
+  dat_plot
+}
+
+loximvi_plot <- plotSample(loximvi, RColorBrewer::brewer.pal(7, "RdBu")[1])
+msto211h_plot <- plotSample(msto211h, RColorBrewer::brewer.pal(7, "RdBu")[1])
+malme3m_plot <- plotSample(malme3m, RColorBrewer::brewer.pal(7, "RdBu")[7])
+hec1b_plot <- plotSample(hec1b, RColorBrewer::brewer.pal(7, "RdBu")[7])
+
+
+drug_plots <- cowplot::plot_grid(loximvi_plot, msto211h_plot, malme3m_plot, hec1b_plot, ncol=2,
+                                 align = "hv")
+
+cowplot::save_plot(drug_plots, filename="trametinib_sample_lines.pdf",
+                   base_width = 4.2, base_height=4.0)
+```
+
+# Fig 5C - Cook lines pathway ~ EMP
+```{r}
+a549 <- readRDS("~/Projects/emt_dynamics/data/A549_Kinase_Untreated.rds")
+du145 <- readRDS("~/Projects/emt_dynamics/data/DU145_Kinase_Untreated.rds")
+mcf7 <- readRDS("~/Projects/emt_dynamics/data/MCF7_Kinase_Untreated.rds")
+ovca420 <- readRDS("~/Projects/emt_dynamics/data/OVCA420_Kinase_Untreated.rds")
+
+seurat <- merge(a549, list(du145, mcf7, ovca420))
+
+meta_list <- readRDS("../../../output/master_metadata_cook_kinase.rds")
+emt_programs <- readLines("../../../output/cook_emt_programs.txt")
+program_scores <- read.csv("../../../output/archetype_program_scores_cook_kinase.csv")
+drug_sensitivity <- read.csv("../../../output/cook_kinase_emp_drug_sensitivity.csv")
+```
+
+Because we have >1 EMT program per line, I'll just do one per line, choosing the one that correlates best with EMT programs
+
+```{r}
+emt_programs <- c("A549_A3", "OVCA420_A4", "DU145_A5", "MCF7_A2")
+```
+
+```{r}
+plotPathway <- function(cell_line, program){
+  dat <- meta_list[[cell_line]]
+  dat[,program]<- dat[,program] / max(dat[,program])
+  dat_plot <- ggplot(dat, aes_string(x=program, y="TGFb")) +
+    geom_point(size=1, shape=16, alpha=0.75, color="black") +
+    geom_smooth(color="firebrick") +
+    xlab("EMP Program") + ylab("TGFB Activity") +
+    ggtitle(cell_line) +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, colour='black'),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=12))
+  dat_plot
+}
+
+a549_plot <- plotPathway("A549", "A3")
+du145_plot <- plotPathway("DU145", "A5")
+mcf7_plot <- plotPathway("MCF7", "A2")
+ovca420_plot <- plotPathway("OVCA420", "A4")
+```
+
+
+
+# Fig 5D - TGFBR1 inhibition on each program
+```{r}
+getGenes <- function(program){
+  hits <- program_scores %>% filter(Program == program &
+                                padj <= 0.05 &
+                                coef >= 0.25) %>%
+    pull(Gene)
+}
+
+a549_genes <- getGenes("A549_A3")
+du145_genes <- getGenes("DU145_A5")
+mcf7_genes <- getGenes("MCF7_A2")
+ovca420_genes <- getGenes("OVCA420_A4")
+```
+
+Set function to score cells by sample-specific EMP
+```{r}
+scoreCells <- function(cell_line, gene_set){
+  seurat_subset <- subset(seurat, 
+                          subset = CellLine == cell_line & 
+                            Drug %in% c("Uninhibited_Untreated", "LY364947"))
+  seurat_subset <- AddModuleScore_UCell(seurat_subset, features = list(EMP_Sig=gene_set),
+                                  name = "")
+  return(seurat_subset@meta.data)
+}
+
+a549_scores <- scoreCells("A549", a549_genes)
+du145_scores <- scoreCells("DU145", du145_genes)
+mcf7_scores <- scoreCells("MCF7", mcf7_genes)
+ovca420_scores <- scoreCells("OVCA420", ovca420_genes)
+```
+
+```{r}
+plotSample <- function(dat){
+  dat$Drug[dat$Drug == "Uninhibited_Untreated"] <- "Untreated"
+  dat$Drug <- factor(dat$Drug, levels=c("Untreated", "LY364947"))
+  dat_plot <- ggplot(dat, aes(Drug, EMP_Sig)) +
+    geom_sina(aes(color=Drug), alpha=0.75, shape=16, size=1) +
+    stat_summary(fun.y="mean",geom="crossbar", width=0.5) +
+    scale_color_manual(values = c("grey", RColorBrewer::brewer.pal(7, "RdBu")[7])) +
+    ylab("EMP Program") + xlab("") +
+    ggtitle("TGFBR1 Inhibition") +
+    theme_classic() +
+    theme(legend.position="none",
+          axis.text.x=element_text(size=12, angle=45, hjust=1, color="black"),
+          axis.text.y=element_text(size=12, color="black"),
+          axis.title = element_text(size=12),
+          plot.title = element_text(size=12, color="black"))
+  dat_plot
+}
+
+a549_inhibition <- plotSample(a549_scores)
+du145_inhibition <- plotSample(du145_scores)
+mcf7_inhibition <- plotSample(mcf7_scores)
+ovca420_inhibition <- plotSample(ovca420_scores)
+```
+
+
+```{r}
+tgfb_plots <- plot_grid(a549_plot, du145_plot, mcf7_plot, ovca420_plot,
+                        a549_inhibition, du145_inhibition, mcf7_inhibition, ovca420_inhibition,
+                        ncol=4,
+                        align="v")
+cowplot::save_plot(tgfb_plots, filename="tgfb_inhibition_plots.pdf",
+                   base_width=9, base_height=5)
+
+tgfb_plots
+```
+
+
+## Some statistics
+### Pathway activity
+```{r}
+#pathways <- colnames(progeny_mat)
+pathways <- c("Androgen", "EGFR", "Estrogen", "Hypoxia", "JAK-STAT", "MAPK", "NFkB", "p53", "PI3K", "TGFb", "TNFa", "Trail", "VEGF", "WNT")
+
+testPathway <- function(pathway, program, df){
+  score_norm <- df[,program] / max(df[,program])
+  test_summary <- summary(lm(df[,pathway] ~ score_norm))
+  test_res <- data.frame(Coef = test_summary$coefficients[2,1],
+                         pval = test_summary$coefficients[2,4],
+                         Pathway = pathway)
+  return(test_res)
+}
+
+runPathwayTests <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  df <- meta_list[[sampleID]]
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  
+  pathway_test_res <- list()
+  for(i in 1:length(total_arch)){
+    test_summary <- lapply(pathways, testPathway, program = total_arch[i], df = df)
+    test_summary <- do.call("rbind", test_summary)
+    test_summary$padj <- p.adjust(test_summary$pval, method="BH")
+    test_summary$Program <- paste0(sampleID, "_", total_arch[i])
+    pathway_test_res[[i]] <- test_summary
+  }
+  
+  pathway_test_res <- do.call("rbind", pathway_test_res)
+}
+```
+
+```{r}
+pathway_scores <- lapply(unique(seurat$CellLine), runPathwayTests)
+pathway_scores <- do.call("rbind", pathway_scores)
+pathway_scores %>% filter(Program %in% emt_programs &
+                            Pathway == "TGFb")
+```
+
+### Drug effect
+```{r}
+drug_sensitivity %>% filter(Program %in% emt_programs & Drug == "LY364947")
+```
+
+
+
+
+
+
+
+
+
+
+
+

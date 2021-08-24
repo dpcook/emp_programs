@@ -1,0 +1,51 @@
+---
+title: "Pan-cancer SCENIC export"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+```{r}
+seurat <- readRDS("../data/pan_cancer_epi.rds")
+```
+
+```{r}
+sample_list <- unique(seurat$SampleID)
+```
+
+
+```{r}
+for(i in 1:length(sample_list)){
+  print(paste0("Exporting sample: ", sample_list[i]))
+  cells_keep <- colnames(seurat)[seurat$SampleID == sample_list[i]]
+  
+  seu <- subset(DietSeurat(seurat), cells=cells_keep)
+  seu <- FindVariableFeatures(seu)
+  var_dat <- seu[["RNA"]]@meta.features
+  var_dat$pct <- rowSums(seu[["RNA"]]@data > 0) / ncol(seu)
+  var_dat <- var_dat %>%
+    filter(pct > 0.05) %>% #detection >5%
+    arrange(desc(vst.variance.standardized))
+  var_genes <- rownames(var_dat)[1:2000]
+  
+  if(length(var_genes) > 2000){
+    var_genes <- var_genes[1:2000]
+  } else {
+    var_genes <- var_genes
+  }
+  
+  exp <- as.matrix(seu[["RNA"]]@counts[var_genes,])
+  exp <- t(exp)
+  exp <- exp[rowSums(exp)!=0,] #Cells with none of these genes. just in case--will throw an error
+  
+  write.table(exp, file=paste0("../output/scenic/", sample_list[i], "_exp.txt"), 
+              sep="\t", quote=F)
+}
+```
+
+
+

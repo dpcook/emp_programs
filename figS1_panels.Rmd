@@ -1,0 +1,206 @@
+---
+title: "Figure S1 - Processing pipeline"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(cowplot)
+library(tidyverse)
+```
+
+```{r}
+seurat <- readRDS("~/Projects/emt_programs/output/tumour_annotations/colorectal_lee_seurat.rds")
+```
+
+```{r}
+p1 <- DimPlot(seurat, group.by="seurat_clusters", label=T, shuffle=T, pt.size=0.1) + NoAxes() + NoLegend()
+p2 <- DimPlot(seurat, group.by="Sample", shuffle=T,pt.size=0.1) + NoAxes() + NoLegend()
+p3 <- DimPlot(seurat, group.by="CellType", label=T, shuffle=T, pt.size=0.1) + NoAxes() + NoLegend()
+```
+
+```{r}
+cowplot::plot_grid(p1, p2, p3, ncol=3)
+```
+
+# Function
+```{r}
+plotData <- function(seurat, title){
+  p1 <- DimPlot(seurat, group.by="seurat_clusters", label=T, 
+                shuffle=T, pt.size=0.1, raster=T) + 
+    NoAxes() + NoLegend() + ggtitle("Clusters") +
+    theme(plot.title = element_text(color="black", size=14, face="plain"))
+  p2 <- DimPlot(seurat, group.by="Sample", 
+                shuffle=T,pt.size=0.1, raster=T) + 
+    NoAxes() + NoLegend()  + ggtitle("Sample") +
+    theme(plot.title = element_text(color="black", size=14, face="plain"))
+  p3 <- DimPlot(seurat, group.by="CellType", label=T, 
+                shuffle=T, pt.size=0.1, raster=T) + 
+    NoAxes() + NoLegend() + ggtitle("Cell type (singleR)") +
+    theme(plot.title = element_text(color="black", size=14, face="plain"))
+  
+  plot_row <- cowplot::plot_grid(p1,p2,p3, ncol=3)
+  
+  #Make title
+  title_plot <- ggdraw() +
+    draw_label(title,
+               x=0,
+               hjust=0) +
+    theme(plot.margin = margin(0,0,0,7))
+  
+  #Plot all
+  dat_plot <- cowplot::plot_grid(title_plot, plot_row, ncol=1, rel_heights = c(0.1, 1))
+  
+ save_plot(filename = paste0("~/Projects/emt_programs/fig_panels/revised_figures/figS1/", 
+                             title, ".pdf"),
+            dat_plot,
+            base_width = 12, base_height=4, device="pdf")
+}
+```
+
+# Colorectal Lee
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/colorectal_lee_seurat.rds")
+plotData(seurat, "Colorectal - Lee et al")
+```
+
+# Colorectal Lee - KUL
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/colorectal_lee_KUL_seurat.rds")
+plotData(seurat, "Colorectal - KUL - Lee et al")
+```
+
+# Colorectal - Uhlitz et al 
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/colorectal_Uhlitz_seurat.rds")
+seurat$Sample <- seurat$orig.ident
+plotData(seurat, "Colorectal - Uhlitz et al")
+```
+
+# Colorectal - Qian et al
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/colorectal_Qian_seurat.rds")
+seurat$Sample <- seurat$orig.ident
+plotData(seurat, "Colorectal - Qian et al")
+```
+
+# Gastric - Sathe et al
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/gastric_sathe_seurat.rds")
+seurat$Sample <- seurat$orig.ident
+plotData(seurat, "Gastric - Sathe et al")
+```
+
+# Lung - Kim et al - GSE131907
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/lung_kim_seurat.rds")
+plotData(seurat, "Lung - Kim et al")
+```
+
+# Lung - Lambrechts et al
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/lung_lambrechts_seurat.rds")
+seurat$Sample <- seurat$orig.ident
+plotData(seurat, "Lung - Lambrechts et al")
+```
+
+# Lung - Laughey et al - GSE123904
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/lung_laughney_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Lung - Laughney et al")
+```
+
+# Lung - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/lung_qian_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Lung - Qian et al")
+```
+
+# Lung - Wu et al
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/lung_wu_seurat.rds")
+plotData(seurat, "Lung - Wu et al")
+```
+
+# Ovarian - Geistlinger et al - GSE154600
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/ovarian_geistlinger_seurat.rds")
+seurat$Sample <- seurat$orig.ident
+plotData(seurat, "Ovarian - Geistlinger et al")
+```
+
+# Ovarian - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/ovarian_qian_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Ovarian - Qian et al")
+```
+
+# PDAC - Steele et al - GSE155698
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/pdac_steele_seurat.rds")
+plotData(seurat, "PDAC - Steele et al")
+```
+
+# Breast - Wu et al - ENA PRJEB35405
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/breast_wu_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Breast - Wu et al")
+```
+
+# Breast - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/breast_qian_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Breast - Qian et al")
+```
+
+# Breast - Bassez et al - http://biokey.lambrechtslab.org/
+
+## Cohort 1
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/breast_bassez_cohort1_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Breast - Cohort1 - Bassez et al")
+```
+
+## Cohort 2
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/breast_bassez_cohort2_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "Breast - Cohort2 - Bassez et al")
+```
+
+# SCC - Ji et al - GSE144236
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/scc_ji_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "SCC - Ji et al")
+```
+
+# Nasopharyngeal Carcinoma - Chen et al - GSE150430
+
+```{r}
+seurat <- readRDS("../../../output/tumour_annotations/npc_chen_seurat.rds")
+seurat$Sample <- seurat$Patient
+plotData(seurat, "NPC - Chen et al")
+```
+

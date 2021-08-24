@@ -1,0 +1,1111 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Goal
+To get some idea of which stromal cell types may be driving EMP-associated expression programs 
+
+# Dependencies
+```{r}
+library(Seurat)
+library(nichenetr)
+library(tidyverse)
+library(ggrepel)
+```
+
+# Load EMP info
+```{r}
+program_scores <- read.csv("~/Projects/emt_programs/output/archetype_program_scores.csv")
+```
+
+```{r}
+assessSig <- function(program){
+  hits <- program_scores %>%
+    filter(Program == program) %>%
+    filter(padj <= 0.05 & coef > 1) %>%
+    arrange(desc(padj)) %>% #Just so genes are actually ranked by significance in the list
+    pull(Gene)#can add coefficient cutoffs if desired
+  return(hits)
+}
+
+program_list <- unique(program_scores$Program)
+program_genes <- lapply(program_list, assessSig)
+names(program_genes) <- program_list
+```
+
+```{r}
+emt_program_names <- readLines("~/Projects/emt_programs/output/emp_program_list_broad.txt")
+emt_program <- program_genes[emt_program_names]
+```
+
+```{r}
+meta_list <- readRDS("~/Projects/emt_programs/output/master_metadata.rds")
+```
+
+# Function through nichenet
+
+A few nichenet components
+
+```{r}
+ligand_target_matrix = readRDS(url("https://zenodo.org/record/3260758/files/ligand_target_matrix.rds"))
+lr_network = readRDS(url("https://zenodo.org/record/3260758/files/lr_network.rds"))
+weighted_networks = readRDS(url("https://zenodo.org/record/3260758/files/weighted_networks.rds"))
+weighted_networks_lr = weighted_networks$lr_sig %>% inner_join(lr_network %>% distinct(from,to), by = c("from","to"))
+```
+
+
+```{r}
+programCheck <- function(sample_name){
+  res <- grep(sample_name, emt_program_names, value=T)
+  return(res)
+}
+```
+
+```{r}
+runNichenet <- function(sample){
+  # Subset seurat by sample
+  print(paste0("Testing sample: ", sample))
+  seurat_subset <- subset(seurat, subset = Patient == sample)
+  
+  #Only want receiver cells to be archetypes - add EMP archetype info to seurat
+  meta <- meta_list[[sample]]
+  meta$ProgramFull <- paste0(sample, "_A", meta$Archetype_Membership)
+  
+  meta$EMP <- ifelse(meta$ProgramFull %in% emt_program_names, "_EMP", "")
+  meta$CellType <- paste0("Cancer cells", meta$EMP)
+  
+  ####FIX CELL BARCODE TO REMOVE APPENDED UNIQUE NUMBER FROM COMBINING EPI DATA
+  ####THIS IS GROSS
+  char_remove <- paste0("_", gsub("^.*_", "", rownames(meta)))
+  rownames(meta) <- gsub(paste0(unique(char_remove), "$"), "", rownames(meta))
+  ####
+  
+  seurat_subset$CellType[match(rownames(meta), colnames(seurat_subset))] <- meta$CellType
+  
+  Idents(seurat_subset) <- seurat_subset$CellType
+  
+  ### Set up chance to exit if not enough cells
+  ### In at least one case (Lung Wu P2) cases there isn't an EMP program
+  if(sum(unique(meta$ProgramFull) %in% emt_program_names) == 0){
+    print("No EMP program")
+  } else {
+  
+  ### RUN NICHENET
+  # Define receiver - EMP cells
+  
+  expressed_genes_receiver = get_expressed_genes("Cancer cells_EMP", seurat_subset, pct = 0.05,
+                                               assay_oi = "RNA")
+  background_expressed_genes = expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+  
+  # Define senders as all possible cell types
+  sender_celltypes = names(table(seurat_subset$CellType))[table(seurat_subset$CellType) > 20] #Don't consider sources w/ <20 cells
+  list_expressed_genes_sender = sender_celltypes %>% unique() %>% 
+    lapply(get_expressed_genes, seurat_subset, pct = 0.05, assay_oi = "RNA")
+  expressed_genes_sender = list_expressed_genes_sender %>% unlist() %>% unique()
+  
+  ligands = lr_network %>% pull(from) %>% unique()
+  receptors = lr_network %>% pull(to) %>% unique()
+
+  expressed_ligands = intersect(ligands,expressed_genes_sender)
+  expressed_receptors = intersect(receptors,expressed_genes_receiver)
+  potential_ligands = lr_network %>% 
+    filter(from %in% expressed_ligands & to %in% expressed_receptors) %>% 
+    pull(from) %>% 
+    unique()
+  
+  # Predict ligands
+  ligand_activities = predict_ligand_activities(geneset = programs[[sample]], 
+                                                background_expressed_genes = background_expressed_genes, 
+                                                ligand_target_matrix = ligand_target_matrix, 
+                                                potential_ligands = potential_ligands)
+  
+  ligand_activities$Sample <- sample
+  
+  ### ADD AVERAGE EXPRESSION
+  ligands <- ligand_activities$test_ligand
+  dat <- seurat_subset[["RNA"]]@data[ligands,]
+  dat <- as.data.frame(t(as.matrix(dat)))
+  dat$CellType <- seurat_subset$CellType
+  
+  dat <- dat %>% 
+    pivot_longer(!CellType, names_to="Gene", values_to="Exp") %>%
+    group_by(CellType, Gene) %>%
+    summarise(pct = sum(Exp > 0) / length(Exp),
+              AvgExp = mean(Exp)) %>%
+    left_join(ligand_activities, by = c("Gene" = "test_ligand"))
+  
+  return(dat)
+  }
+}
+```
+
+
+# Colorectal - Lee et al - GSE144735 (SMC)
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Lee"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+colorectal_lee_smc <- lapply(names(programs), runNichenet)
+names(colorectal_lee_smc) <- names(programs)
+```
+
+# Colorectal - Lee et al - GSE132465 (KUL)
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_KUL_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Lee"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+colorectal_lee_kul <- lapply(names(programs), runNichenet)
+names(colorectal_lee_kul) <- names(programs)
+```
+
+# Colorectal - Uhlitz et al - Data direct from authors (preprint)
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Uhlitz_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Uhlitz"
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+colorectal_uhlitz <- lapply(names(programs), runNichenet)
+names(colorectal_uhlitz) <- names(programs)
+```
+
+# Colorectal - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Qian"
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+colorectal_qian <- lapply(names(programs), runNichenet)
+names(colorectal_qian) <- names(programs)
+```
+
+# Gastric - Sathe et al - https://dna-discovery.stanford.edu
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/gastric_sathe_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Gastric"
+seurat$Source <- "Sathe"
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+gastric_sathe <- lapply(names(programs), runNichenet)
+names(gastric_sathe) <- names(programs)
+```
+
+# Lung - Kim et al - GSE131907
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_kim_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Kim"
+seurat$Patient <- seurat$Sample
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+lung_kim <- lapply(names(programs), runNichenet)
+names(lung_kim) <- names(programs)
+```
+
+# Lung - Lambrechts et al - E-MTAB-6149 & E-MTAB-6653
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_lambrechts_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Lambrechts"
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+lung_lambrechts <- lapply(names(programs), runNichenet)
+names(lung_lambrechts) <- names(programs)
+```
+
+# Lung - Laughey et al - GSE123904
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_laughney_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Laughney"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+lung_laughney <- lapply(names(programs), runNichenet)
+names(lung_laughney) <- names(programs)
+```
+
+# Lung - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Qian"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+lung_qian <- lapply(names(programs), runNichenet)
+names(lung_qian) <- names(programs)
+```
+
+# Lung - Wu et al - GSE148071
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_wu_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Wu"
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+lung_wu <- lapply(names(programs), runNichenet)
+names(lung_wu) <- names(programs)
+```
+
+# Ovarian - Geistlinger et al - GSE154600
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_geistlinger_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Ovarian"
+seurat$Source <- "Geistlinger"
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+ovarian_geistlinger <- lapply(names(programs), runNichenet)
+names(ovarian_geistlinger) <- names(programs)
+```
+
+# Ovarian - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Ovarian"
+seurat$Source <- "Qian"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+ovarian_qian <- lapply(names(programs), runNichenet)
+names(ovarian_qian) <- names(programs)
+```
+
+
+# PDAC - Steele et al - GSE155698
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/pdac_steele_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "PDAC"
+seurat$Source <- "Steele"
+seurat$Patient <- gsub("PDAC_", "", seurat$Sample)
+
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+pdac_steele <- lapply(names(programs), runNichenet)
+names(pdac_steele) <- names(programs)
+```
+
+# Breast - Wu et al - ENA PRJEB35405
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_wu_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Wu"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+breast_wu <- lapply(names(programs), runNichenet)
+names(breast_wu) <- names(programs)
+```
+
+# Breast - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Qian"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+breast_qian <- lapply(names(programs), runNichenet)
+names(breast_qian) <- names(programs)
+```
+
+# Breast - Bassez et al - http://biokey.lambrechtslab.org/
+
+## Cohort 1
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort1_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Bassez"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+breast_bassez_cohort1 <- lapply(names(programs), runNichenet)
+names(breast_bassez_cohort1) <- names(programs)
+```
+
+## Cohort 2
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort2_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Bassez"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+breast_bassez_cohort2 <- lapply(names(programs), runNichenet)
+names(breast_bassez_cohort2) <- names(programs)
+```
+
+# SCC - Ji et al - GSE144236
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/scc_ji_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "SCC"
+seurat$Source <- "Ji"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+scc_ji <- lapply(names(programs), runNichenet)
+names(scc_ji) <- names(programs)
+```
+
+# Nasopharyngeal Carcinoma - Chen et al - GSE150430
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/npc_chen_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "NPC"
+seurat$Source <- "Chen"
+seurat$Patient <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+```
+
+```{r}
+sample_list <- unique(seurat$Patient)
+sample_program_list <- lapply(sample_list, programCheck)
+names(sample_program_list) <- sample_list
+sample_program_list <- sample_program_list[lengths(sample_program_list) > 0]
+programs <- list()
+for(i in 1:length(sample_program_list)){
+  programs[[i]] <- emt_program[sample_program_list[[i]]]
+  programs[[i]] <- unique(unlist(programs[[i]]))
+}
+names(programs) <- names(sample_program_list)
+```
+
+```{r}
+npc_chen <- lapply(names(programs), runNichenet)
+names(npc_chen) <- names(programs)
+```
+
+# Combine data
+```{r}
+niche_res <- c(colorectal_lee_smc, colorectal_lee_kul, colorectal_uhlitz, colorectal_qian,
+                 lung_kim, lung_laughney, lung_lambrechts, lung_qian, pdac_steele,
+                 scc_ji, breast_wu, breast_qian, ovarian_geistlinger, ovarian_qian,
+               gastric_sathe, breast_bassez_cohort1, breast_bassez_cohort2, npc_chen,
+               lung_wu)
+
+#Lung_Wu_P2 is null because it had no cells as cancer_EMP
+
+niche_res <- niche_res[-which(names(niche_res)=="Lung_Wu_P2")]
+
+niche_res <- lapply(niche_res, as.data.frame)
+niche_res <- do.call("bind_rows", niche_res)
+
+#when we combined epithelial cells, we omitted cells annotated as "Epithelial" that were part of a cluster that was very clearly not epithelial (determined by the "epithelial" annotation representing a very small fraction of the cluster)
+
+#These stray epithelial cells were included as senders in the analysis. Because these strays spanned multiple clusters and were rare, it makes the most sense to remove them. Fortunately they are the only cells left annotated as "Epithelial_cells", so they can be filtered easily
+niche_res <- filter(niche_res, CellType != "Epithelial_cells")
+```
+
+```{r}
+saveRDS(niche_res, file="../output/nichenet_res.rds")
+```
+
+```{r}
+niche_res <- readRDS("../output/nichenet_res.rds")
+```
+
+# Explore a bit
+```{r}
+pearson_dist_plot <- niche_res %>%
+  select(c(Sample, Gene, pearson)) %>%
+  unique() %>%
+  ggplot(aes(Sample, pearson)) +
+  geom_boxplot(outlier.size = 0, fill="firebrick", alpha=0.5) +
+  xlab("") + ylab("Pearson") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle=45, hjust=1, colour="black", size=8),
+        axis.text.y = element_text(size=10, colour="black"))
+ggsave(pearson_dist_plot, filename="../figs/nichenet_pearson_dist.pdf",
+       width=15, height=4.75, device=cairo_pdf())
+```
+
+```{r}
+pearson_dist_plot
+```
+Given the variation in the distribution, I think something like top 10-20 per sample seems reasonable. Let's go with 10
+
+```{r}
+good_ligands <- niche_res %>%
+  select(c("Sample", "pearson", "Gene")) %>%
+  unique() %>%
+  group_by(Sample) %>%
+  top_n(10, pearson) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  summarise(Count = length(Sample)) %>%
+  arrange(desc(Count)) %>%
+  mutate(Rank = 1:nrow(.))
+good_ligands
+```
+
+```{r}
+normal12 <- c("#ebac23", #EMP
+              "#008cf9",#Cancer
+              "#b80058", #Fib
+              "#B24502", #Smooth muscle
+              "#00bbad", #Endo
+              "#d163e6", #Macro
+              "#FF9287", #Mono
+              "#006e00", #B
+              "#5954D6", #T
+              "#00C6F8", #NK
+              "#878500", #DC
+              "#00A76C", #Platelets
+              "#bdbdbd") #Unkown
+```
+
+
+```{r}
+good_ligands$Label <- ""
+good_ligands$Label[1:25] <- good_ligands$Gene[1:25]
+
+
+## Add color by highest expressing cell type
+niche_summary <- niche_res %>%
+  filter(Gene %in% unique(good_ligands$Gene)) %>%
+  group_by(CellType, Gene) %>%
+  summarise(Exp = mean(AvgExp, na.rm = T),
+            Pct = mean(pct, na.rm=T)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  filter(Exp == max(Exp))
+
+merge_dat <- left_join(good_ligands, niche_summary, by="Gene")
+merge_dat$CellType <- factor(merge_dat$CellType, 
+                             levels = c("Cancer cells_EMP", "Cancer cells", "Fibroblasts",
+                                        "Smooth_muscle_cells", "Endothelial_cells", 
+                                        "Macrophage", "Monocyte", "B_cell", 
+                                        "T_cells", "NK_cell", "DC", "Platelets", "Unknown"))
+
+
+ligand_freq_plot <- ggplot(merge_dat, aes(Rank, Count, label=Label)) +
+  geom_point(size=1, color="black") +
+  geom_text_repel(aes(color=CellType),
+                  max.overlaps = 1000,
+                  min.segment.length=0,
+                  direction="y",
+                  nudge_x=125,
+                  size=3.25,
+                  hjust=0,
+                  segment.size=0.2,
+                  segment.alpha=0.75,
+                  segment.color="black") +
+  xlab("Ranked Ligands") + ylab("Top ligand frequency (/266)") + 
+  scale_y_continuous(breaks=c(0,20, 40, 60, 80, 100), limits=c(0,100)) +
+  scale_color_manual(values=normal12) +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.y = element_text(size=10, color="black"),
+        axis.title.y = element_text(size=12))
+
+ggsave(ligand_freq_plot, filename="../figs/nichenet_top_ligand_freq.pdf",
+       width=5, height=3.75, device=cairo_pdf())
+```
+
+```{r}
+ligand_freq_plot
+```
+
+# DotPlot Summary
+
+Essentially recreating the standard Seurat dotplot 
+
+```{r}
+ligands <- good_ligands$Gene[1:50]
+```
+
+
+```{r}
+niche_summary <- niche_res %>%
+  filter(Gene %in% ligands) %>%
+  group_by(CellType, Gene) %>%
+  summarise(Exp = mean(AvgExp, na.rm = T),
+            Pct = mean(pct, na.rm=T))
+```
+
+
+I'm going to make a dotplot, but I'd like the ligands/cell types to be ordered in a visually appealing way. I'll make a clustered heatmap, steal the order, and then use it on this
+```{r}
+niche_tmp <- niche_summary %>%
+  select(c("CellType", "Gene", "Exp")) %>%
+  pivot_wider(names_from="Gene", values_from="Exp")
+niche_mat <- as.matrix(niche_tmp[,2:ncol(niche_tmp)])
+rownames(niche_mat) <- niche_tmp$CellType
+
+niche_heat <- pheatmap::pheatmap(niche_mat,
+                                 silent=T,
+                                 clustering_method = "ward.D2")
+```
+
+
+```{r}
+#Aesthetic things
+niche_dot <- niche_summary
+niche_dot$Exp[niche_dot$Exp > 1] <- 1
+niche_dot$Pct[niche_dot$Pct > 0.5] <- 0.5
+niche_dot$Pct <- niche_dot$Pct * 100
+niche_dot$CellType <- factor(niche_dot$CellType,
+                             levels = rownames(niche_mat)[niche_heat$tree_row$order])
+niche_dot$Gene <- factor(niche_dot$Gene,
+                             levels = colnames(niche_mat)[niche_heat$tree_col$order])
+
+#Plot
+dot <- ggplot(niche_dot, aes(x=Gene, y=CellType)) +
+  geom_point(aes(size = Pct, fill = Exp), color="black", shape=21) +
+  scale_size("% Exp", range = c(0,6)) +
+  scale_fill_gradientn(colours = viridisLite::mako(100),
+                       limits = c(0,1),
+                       guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black"),
+                       name = "Avg Exp") +
+  ylab("") + xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_text(size=10, angle=45, hjust=1, color="black"),
+        axis.text.y = element_text(size=12, color="black"))
+
+#Save
+ggsave(dot, filename="../figs/nichnet_dotplot.pdf",
+       device = cairo_pdf(),
+       width=12, height=4.25)
+ggsave(dot, filename="../figs/nichnet_dotplot.png",
+       width=12, height=4.25) #width=12
+```
+
+# MAPK vs. Hypoxia EMP
+
+## Run PCA first
+## Prep data
+```{r}
+sample_list <- names(meta_list)
+```
+
+```{r}
+#pathways <- colnames(progeny_mat)
+pathways <- c("Androgen", "EGFR", "Estrogen", "Hypoxia", "JAK-STAT", "MAPK", "NFkB", "p53", "PI3K", "TGFb", "TNFa", "Trail", "VEGF", "WNT")
+
+testPathway <- function(pathway, program, df){
+  score_norm <- df[,program] / max(df[,program])
+  test_summary <- summary(lm(df[,pathway] ~ score_norm))
+  test_res <- data.frame(Coef = test_summary$coefficients[2,1],
+                         pval = test_summary$coefficients[2,4],
+                         Pathway = pathway)
+  return(test_res)
+}
+
+runPathwayTests <- function(sampleID){
+  print(paste0("Testing: ", sampleID))
+  df <- meta_list[[sampleID]]
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  
+  pathway_test_res <- list()
+  for(i in 1:length(total_arch)){
+    test_summary <- lapply(pathways, testPathway, program = total_arch[i], df = df)
+    test_summary <- do.call("rbind", test_summary)
+    test_summary$padj <- p.adjust(test_summary$pval, method="BH")
+    test_summary$Program <- paste0(sampleID, "_", total_arch[i])
+    pathway_test_res[[i]] <- test_summary
+  }
+  
+  pathway_test_res <- do.call("rbind", pathway_test_res)
+}
+```
+
+```{r}
+pathway_scores <- lapply(sample_list, runPathwayTests)
+pathway_scores <- do.call("rbind", pathway_scores)
+```
+
+```{r}
+pathway_coef <- pathway_scores
+pathway_coef$padj <- NULL
+pathway_coef$pval <- NULL
+pathway_coef <- pivot_wider(pathway_coef, names_from=Pathway, values_from=Coef)
+pathway_coef <- as.data.frame(pathway_coef)
+rownames(pathway_coef) <- pathway_coef$Program
+pathway_coef$Program <- NULL
+pathway_coef <- as.matrix(pathway_coef)
+```
+
+```{r}
+pca_res <- prcomp(pathway_coef, scale=F)
+```
+
+```{r}
+emp_programs <- readLines("../output/emp_program_list_broad.txt")
+emt_program <- factor(rownames(pathway_coef) %in% emp_programs)
+```
+
+```{r}
+pca1 <- fviz_pca_biplot(pca_res, geom.ind="point", axes=c(1,2),
+                col.ind = emt_program, repel=T) +
+  scale_color_manual(values=c('lightgrey', 'firebrick'))
+
+pca1
+```
+
+## Compare MAPK vs. JAK-STAT
+```{r}
+mapk_programs <- rownames(pca_res$x)[rownames(pca_res$x) %in% emp_programs &
+                                       pca_res$x[,2] < -1 &
+                                       pca_res$x[,1] > 0]
+mapk_programs <- substr(mapk_programs, 1, nchar(mapk_programs)-3) %>% unique()
+
+stat_programs <- rownames(pca_res$x)[rownames(pca_res$x) %in% emp_programs &
+                                       pca_res$x[,2] > 1 &
+                                       pca_res$x[,1] > 0]
+stat_programs <- substr(stat_programs, 1, nchar(stat_programs)-3) %>% unique()
+```
+
+```{r}
+mapk_ligands <- niche_res %>%
+  filter(Sample %in% mapk_programs) %>%
+  select(c("Sample", "pearson", "Gene")) %>%
+  unique() %>%
+  group_by(Sample) %>%
+  top_n(20, pearson) %>% #results are actually a bit cleaner if you go with top 10
+  ungroup()
+
+
+
+mapk_ligand_count <- mapk_ligands %>% group_by(Gene) %>%
+  summarise(Count = length(Sample)) %>%
+  arrange(desc(Count)) %>%
+  mutate(Rank = 1:nrow(.))
+mapk_ligand_count$Count <- mapk_ligand_count$Count / length(mapk_programs)
+#The above line accounts for differences in the number of MAPK and STAT-associated programs. Convert to proportion
+
+
+stat_ligands <- niche_res %>%
+  filter(Sample %in% stat_programs) %>%
+  select(c("Sample", "pearson", "Gene")) %>%
+  unique() %>%
+  group_by(Sample) %>%
+  top_n(20, pearson) %>% #results are actually a bit cleaner if you go with top 10
+  ungroup()
+
+
+
+stat_ligand_count <- stat_ligands %>% group_by(Gene) %>%
+  summarise(Count = length(Sample)) %>%
+  arrange(desc(Count)) %>%
+  mutate(Rank = 1:nrow(.))
+stat_ligand_count$Count <- stat_ligand_count$Count / length(stat_programs) 
+```
+
+```{r}
+#common_ligands <- intersect(mapk_ligand_count, stat_ligand_count)
+
+merge_dat <- left_join(mapk_ligand_count, stat_ligand_count, by="Gene")
+merge_dat <- na.omit(merge_dat)
+merge_dat$CountDiff <- merge_dat$Count.x - merge_dat$Count.y #The difference in proportion
+merge_dat <- arrange(merge_dat, desc(CountDiff))
+merge_dat$Rank <- 1:nrow(merge_dat)
+
+```
+
+## Plot
+Add colour by cell type with highest expression maybe??
+```{r}
+mapk_ligands <- c(merge_dat %>% filter(CountDiff > 0.075) %>% pull(Gene)) 
+stat_ligands <- c(merge_dat %>% filter(CountDiff < -0.075) %>% pull(Gene))
+
+merge_dat$mapk_Label <- ""
+merge_dat$mapk_Label[match(mapk_ligands, merge_dat$Gene)] <- mapk_ligands
+
+merge_dat$stat_Label <- ""
+merge_dat$stat_Label[match(stat_ligands, merge_dat$Gene)] <- stat_ligands
+
+# Get expression info for ligands
+niche_summary <- niche_res %>%
+  filter(Gene %in% unique(merge_dat$Gene)) %>%
+  group_by(CellType, Gene) %>%
+  summarise(Exp = mean(AvgExp, na.rm = T),
+            Pct = mean(pct, na.rm=T)) %>%
+  ungroup() %>%
+  group_by(Gene) %>%
+  filter(Exp == max(Exp))
+
+merge_dat <- left_join(merge_dat, niche_summary, by="Gene")
+merge_dat$CellType <- factor(merge_dat$CellType, 
+                             levels = c("Cancer cells_EMP", "Cancer cells", "Fibroblasts",
+                                        "Smooth_muscle_cells", "Endothelial_cells", 
+                                        "Macrophage", "Monocyte", "B_cell", 
+                                        "T_cells", "NK_cell", "DC", "Platelets", "Unknown"))
+
+# Plot
+diff_plot <- ggplot(merge_dat, aes(x=Rank, y=CountDiff)) +
+  geom_point(aes(fill=CellType, size=Exp), colour="black", shape=21, alpha=0.6) +
+  geom_hline(yintercept = c(-0.075, 0.075), linetype=2) +
+  geom_text_repel(aes(label = mapk_Label, color=CellType),
+                  nudge_x = 50,
+                  direction = "y",
+                  force=0.5,
+                  ylim = c(0.075,NA),
+                  hjust= 0,
+                  size=3,
+                  segment.size = 0.2,
+                  segment.color="black") +
+  geom_text_repel(aes(label = stat_Label, color=CellType),
+                  nudge_x = -50,
+                  force=0.5,
+                  direction = "y",
+                  ylim = c(NA,-0.075),
+                  hjust= 1,
+                  size=3,
+                  segment.size = 0.2,
+                  segment.color="black") +
+  scale_y_continuous(expand = c(0, 0), breaks=c(-0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3), limits=c(-0.3, 0.3)) +
+  scale_fill_manual(values = normal12,
+                    name="Highest expressing\ncell type") +
+  scale_colour_manual(values = normal12,
+                    name="Highest expressing\ncell type") +
+  guides(colour = guide_legend(override.aes = list(size=4))) +
+  ylab("Difference in program frequency") +
+  theme_classic() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.text.y = element_text(size=10, colour="black"),
+        axis.title.y = element_text(size=12),
+        legend.text = element_text(size=10, color="black"),
+        legend.title = element_text(size=12))
+
+diff_plot
+```
+
+
+
+
+

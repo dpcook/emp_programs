@@ -1,0 +1,181 @@
+---
+title: "Gene set scoring"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(UCell)
+library(matrixStats)
+library(ggridges)
+```
+
+# Load data
+
+```{r}
+seurat <- readRDS("../data/pan_cancer_epi.rds")
+meta_list <- readRDS("../output/master_metadata.rds")
+```
+
+
+```{r}
+hallmarks <- fgsea::gmtPathways("~/Data/GeneLists/hallmark.genesets.v6.1.symbols.gmt")
+hallmark_emt <- hallmarks["HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]
+
+#My conserved upregulated list
+conserved_mes <- list(readr::read_lines("~/Projects/emt_dynamics/output/conserved_upregulated_genes.csv")[-1])
+names(conserved_mes) <- "Conserved_EMT_Up"
+
+#Puram HNSCC pEMT
+puram <- read.csv("~/Data/GeneLists/puram_hnscc_pEMT_signatures.csv")
+puram <- list(unique(puram$Gene)) #All unique genes from their list of 50-gene NMF programs
+names(puram) <- "Puram_pEMT"
+
+#Conserved EMP genes from this paper
+emp_genes <- readLines("../output/conserved_emt_signature.txt")
+```
+
+# Set up scoring
+```{r}
+null.list <- list()
+for(i in 1:100){
+  print(paste0("Null permutation: ", i))
+  random_genes <- base::sample(1:nrow(seurat),
+                               length(emp_genes),
+                               replace=F)
+  random_genes <- rownames(seurat)[random_genes]
+  scores <- ScoreSignatures_UCell(seurat[["RNA"]]@counts,
+                                  features = list(Random = random_genes))
+  null.list[[i]] <- data.frame(scores = scores[,1])
+  colnames(null.list[[i]]) <- paste0("Permutation_", i)
+}
+null.list <- do.call("cbind", null.list)
+null.list <- as.matrix(null.list)
+#If I grab colVars, I should get the null variance of gene set scores
+```
+
+```{r}
+write.csv(null.list, file="../output/gene_set_null_permutations.csv")
+```
+
+```{r}
+null.list <- read.csv("../output/gene_set_null_permutations.csv", row.names=1)
+```
+
+```{r}
+null.list <- as.matrix(null.list)
+```
+
+# Compare scores w/ null
+
+
+```{r}
+table(var(seurat$EMT_Sig) < colVars(null.list))
+```
+Lowest p-value we can compute is p=0.01
+
+```{r}
+null_vars <- data.frame(Var = colVars(null.list),
+                        Statistic = "Var")
+sig_vars <- seurat@meta.data %>%
+  group_by(Cancer, SampleID) %>%
+  summarise(Var = var(EMT_Sig)) %>%
+  mutate(Statistic = "Var")
+```
+
+```{r}
+var_plot <- ggplot(null_vars, aes(y=Statistic, x=Var)) +
+  geom_jitter(color="black") +
+  geom_jitter(data=sig_vars, aes(color=Cancer)) +
+  scale_x_continuous(limits=c(0, max(sig_vars$Var) + 0.001), expand=c(0,0)) +
+  ylab("") + xlab("Score Variance") +
+  theme_classic() +
+  theme(axis.text.x=element_text(size=12, color="black"),
+        axis.title.x=element_text(size=14),
+        axis.text.y=element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+var_plot
+```
+
+This is actually nice
+
+# Distribution of EMP score w/ null
+```{r}
+df <- seurat@meta.data
+df$Null <- rowMeans(null.list)
+df <- df %>%
+  select(c("EMT_Sig", "Cancer", "SampleID", "Null", "Source")) %>%
+  pivot_longer(cols = -c("Cancer", "Source", "SampleID"),
+               values_to = "Score",
+               names_to = "Group")
+df$Group <- factor(df$Group, levels=c("Null", "EMT_Sig"))
+```
+
+
+```{r}
+cancer_emp <- ggplot(df, aes(x=Score, y=SampleID)) +
+  geom_density_ridges(aes(fill=Group), color="black", alpha=0.75) +
+  facet_wrap(~Cancer, ncol=4) +
+  theme_ridges()
+```
+
+```{r}
+cols <- RColorBrewer::brewer.pal(7, "Dark2")
+
+plot_dist <- function(cancer){
+  df <- filter(df, Cancer == cancer)
+  cancer_emp <- ggplot(df, aes(x=SampleID, y=Score)) +
+    geom_boxplot(aes(fill=Source, color=Group), alpha=0.75, outlier.size = 0) +
+    scale_fill_manual(values=c(cols[1:length(unique(df$Source))]),
+                      name="Study") +
+    scale_color_manual(values=c("red", "black"), labels = c("Null", "EMP Sig"),
+                       name="") +
+    xlab("") + ylab("EMP Signature Score") + ggtitle(cancer) +
+    #facet_wrap(~Source, scales="free") +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.y = element_text(size=12, color="black"),
+          axis.title.y = element_text(size=14))
+  return(cancer_emp)
+}
+```
+
+```{r}
+colorectal <- plot_dist("Colorectal")
+gastric <- plot_dist("Gastric")
+lung <- plot_dist("Lung")
+ovarian <- plot_dist("Ovarian")
+pdac <- plot_dist("PDAC")
+breast <- plot_dist("Breast")
+scc <- plot_dist("SCC")
+npc <- plot_dist("NPC")
+```
+
+
+```{r}
+top_row <- cowplot::plot_grid(lung)
+middle_row <- cowplot::plot_grid(breast, gastric, rel_widths = c(4.5,1), ncol=2)
+bottom_row <- cowplot::plot_grid(gastric, ovarian, npc, pdac, scc,
+                                 rel_widths = c(8.5,9.5,9,11, 9), ncol=5)
+```
+
+```{r}
+all_plots <- cowplot::plot_grid(top_row, middle_row, bottom_row, ncol=1)
+```
+
+```{r}
+cowplot::save_plot(all_plots,
+                   filename="../figs/emt_score_dist.pdf",
+                   base_width=16, base_height=11)
+```
+
+Repeat this visualization for technical variables
+
+
+
+
+
+
+

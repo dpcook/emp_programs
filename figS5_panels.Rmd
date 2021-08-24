@@ -1,0 +1,144 @@
+---
+title: "Figure S3 Panels"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(pheatmap)
+```
+
+```{r}
+program_scores <- read.csv("../../../output/archetype_program_scores.csv")
+emt_programs <- readLines("../../../output/emp_program_list.txt")
+seurat <- readRDS("../../../data/pan_cancer_epi.rds")
+meta_list <- readRDS("../../../output/master_metadata.rds")
+```
+
+# EMT Gene Coef Dotplot
+```{r}
+program_coef <- program_scores
+program_coef$padj <- NULL
+program_coef$pval <- NULL
+program_coef <- pivot_wider(program_coef, names_from=Program, values_from=coef)
+program_coef <- as.data.frame(program_coef)
+rownames(program_coef) <- program_coef$Gene
+program_coef$Gene <- NULL
+program_coef <- as.matrix(program_coef)
+```
+
+```{r}
+emt_genes <- c("SNAI1", "SNAI2", "VIM", "CDH2", "ZEB1", "TWIST1")
+program_coef <- program_coef[emt_genes, emt_programs]
+program_coef[is.na(program_coef)] <- 0
+```
+
+```{r}
+pheatmap(program_coef,
+         color=colorRampPalette(rev(RColorBrewer::brewer.pal(7, name = "RdBu")))(100),
+         breaks=seq(-1, 1, length.out=101),
+         na_col = "lightgrey",
+         cluster_rows=T,
+         cluster_cols=T,
+         show_rownames=T,
+         show_colnames=F,
+         clustering_method="ward.D2",
+         legend=F,
+         filename = "marker_heatmap.png",
+         dpi=600, width=6, height=2.5)
+```
+
+# Histograms and trendline
+## Coef hist
+
+```{r}
+cols <- rev(RColorBrewer::brewer.pal(7, "RdBu"))
+
+getVolcano <- function(gene){
+  dat <- program_scores %>%
+    filter(Gene == gene & Program %in% emt_programs)
+  dat$Sig <- "No"
+  dat$Sig[dat$padj <= 0.05 & dat$coef > 1] <- "Up"
+  dat$Sig[dat$padj <= 0.05 & dat$coef < -1] <- "Down"
+  dat$Sig <- factor(dat$Sig, levels=c("Down", "No", "Up"))
+  
+  coef_hist <- ggplot(dat, aes(x=coef, y=-log10(padj))) +
+    geom_point(aes(color=Sig), shape=16, size=0.75) +
+    geom_vline(xintercept=c(-1, 1), linetype=2, size=0.5) +
+    geom_hline(yintercept=c(-log10(0.05)), linetype=2, size=0.5) +
+    scale_color_manual(values=c(cols[1], "grey20", cols[7]), drop=F) +
+    ggtitle(gene) +
+    xlab("EMP model coefficient") + ylab("-log10(p-value)") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=14, color="black", face="italic"),
+          legend.position="none")
+  return(coef_hist)
+}
+
+snai1_hist <- getVolcano("SNAI1")
+snai2_hist <- getVolcano("SNAI2")
+vim_hist <- getVolcano("VIM")
+zeb1_hist <- getVolcano("ZEB1")
+cdh2_hist <- getVolcano("CDH2")
+twist1_hist <- getVolcano("TWIST1")
+```
+
+## Exp plot
+```{r}
+getExpPlot <- function(gene){
+  program <- program_scores %>%
+    filter(Program %in% emt_programs &
+             Gene == gene)
+  program <- program$Program[which(program$coef == max(program$coef))]
+
+    
+  sampleID <- substr(program, 1, nchar(program)-3)
+  arch <- substr(program, nchar(program)-1, nchar(program))
+  
+  meta <- meta_list[[sampleID]]
+  meta[,gene] <- seurat[["RNA"]]@data[gene, rownames(meta)]
+  meta[,arch] <- meta[,arch] / max(meta[,arch])
+  
+  print(paste0(gene, ": ", sampleID))
+  
+  exp_plot <- ggplot(meta, aes_string(arch, gene)) +
+    geom_point(size=0.1, colour="firebrick", alpha=0.5) +
+    geom_smooth(color="black") +
+    ggtitle(gsub("_", " - ", sampleID)) +
+    scale_x_continuous(breaks=c(0,0.5,1)) +
+    ylab("log(TP10k+1)") + xlab("EMP program activity") +
+    theme_classic() +
+    theme(axis.text=element_text(size=10, color="black"),
+          axis.title=element_text(size=12),
+          plot.title = element_text(size=10))
+  exp_plot
+}
+
+snai1 <- getExpPlot("SNAI1")
+snai2 <- getExpPlot("SNAI2")
+vim <- getExpPlot("VIM")
+zeb1 <- getExpPlot("ZEB1")
+cdh2 <- getExpPlot("CDH2")
+twist1 <- getExpPlot("TWIST1")
+```
+
+# Merge plot
+```{r}
+emt_plots <- cowplot::plot_grid(snai1_hist, snai2_hist, vim_hist,
+                                snai1, snai2, vim,
+                                zeb1_hist, cdh2_hist, twist1_hist,
+                                zeb1, cdh2, twist1,
+                                ncol=3, align="hv")
+```
+
+```{r}
+cowplot::save_plot(emt_plots, filename="emt_marker_exp.pdf",
+                   base_height=8, base_width=9)
+```
+
+
+
+

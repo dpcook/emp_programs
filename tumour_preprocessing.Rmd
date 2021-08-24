@@ -1,0 +1,2365 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Goal
+This notebook will show the processing of UMI matrices as they were provided.
+
+We will make Seurat objects and perform initial cell type annotation with singleR
+
+# Dependencies
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(SingleR)
+library(celldex)
+library(data.table)
+library(scDblFinder)
+library(Matrix)
+```
+
+First, we'll just set up our annotation. We'll use celldex's
+```{r}
+ref <- HumanPrimaryCellAtlasData()
+```
+
+```{r}
+cell_types <- c("Fibroblasts", "Monocyte", "Endothelial_cells", "T_cells", 
+                "NK_cell", "B_cell", "Macrophage", "Smooth_muscle_cells",
+                "DC", "Platelets", "Epithelial_cells")
+
+ref <- ref[,ref$label.main %in% cell_types]
+```
+
+
+# Colorectal - Lee et al - GSE144735 (SMC)
+```{r}
+exp <- fread("~/Data/single_cell_datasets/colorectal_lee/data/raw_UMI_count_matrix.txt",
+                  sep="\t", header=T)
+meta <- fread("~/Data/single_cell_datasets/colorectal_lee/data/GSE132465_cell_annotation.txt",
+              sep="\t", header=T)
+
+gene_list <- exp$Index
+cell_list <- colnames(exp)[2:ncol(exp)]
+exp <- as.matrix(exp[,2:ncol(exp)])
+exp <- as(exp, "dgCMatrix")
+rownames(exp) <- gene_list
+
+meta <- as.data.frame(meta)
+rownames(meta) <- meta$Index
+```
+
+```{r}
+seurat <- CreateSeuratObject(counts=exp,
+                             meta.data = meta,
+                             min.cells = 3,
+                             min.features = 200)
+rm(exp, meta, cell_list, gene_list)
+
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+Already filtered on percent mito and an upper limit of nFeature it seems
+
+```{r}
+seurat <- subset(seurat, subset = Class == "Tumor")
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples = "Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/colorectal_lee_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/colorectal_lee_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/colorectal_lee_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/colorectal_lee_meta.csv")
+```
+
+# Colorectal - Lee et al - GSE132465 (KUL)
+```{r}
+exp <- fread("~/Data/single_cell_datasets/colorectal_lee/data/KUL3_CRC_10X_raw_UMI_count_matrix.txt",
+             sep="\t", header=T)
+meta <- fread("~/Data/single_cell_datasets/colorectal_lee/data/KUL3_CRC_10X_annotation.txt",
+              sep="\t", header=T)
+
+gene_list <- exp$Index
+cell_list <- colnames(exp)[2:ncol(exp)]
+exp <- as.matrix(exp[,2:ncol(exp)])
+exp <- as(exp, "dgCMatrix")
+rownames(exp) <- gene_list
+
+meta <- as.data.frame(meta)
+rownames(meta) <- meta$Index
+```
+
+```{r}
+seurat <- CreateSeuratObject(counts=exp,
+                             meta.data = meta,
+                             min.cells = 3,
+                             min.features = 200)
+
+rm(exp, meta, cell_list, gene_list)
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+Already filtered on percent mito and an upper limit of nFeature it seems
+
+```{r}
+seurat <- subset(seurat, subset = Class == "Tumor")
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/colorectal_lee_KUL_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/colorectal_lee_KUL_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/colorectal_lee_KUL_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/colorectal_lee_KUL_meta.csv")
+```
+
+
+# Colorectal - Uhlitz et al - Data direct from authors (preprint)
+```{r}
+p007t <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p007t_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p008t <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p008t_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p009t1 <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p009t1_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p009t2 <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p009t2_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p012t <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p012t_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p014t <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p014t_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p016t <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p016t_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+p017t <- as(t(as.matrix(read.csv("~/Data/single_cell_datasets/colorectal_uhlitz/data/p017t_matrix.csv",
+                  row.names = 1))), "dgCMatrix")
+```
+
+```{r}
+annotation <- data.frame(orig.ident = c("p007t","p008t","p009t1", "p009t2",
+                                        "p012t", "p014t",  "p016t", "p017t"),
+                         patient = c("P07", "P08", "P09", "P09",
+                                     "P12", "P14", "P16", "P17"),
+                         tissue = c("Tumour", "Tumour","Tumour", "Tumour",
+                                    "Tumour", "Tumour","Tumour", "Tumour"))
+```
+
+```{r}
+p007t <- CreateSeuratObject(counts = p007t, 
+                             project = "p007t",
+                             min.features = 200,
+                             min.cells = 3)
+p008t <- CreateSeuratObject(counts = p008t, 
+                             project = "p008t",
+                             min.features = 200,
+                             min.cells = 3)
+p009t1 <- CreateSeuratObject(counts = p009t1, 
+                             project = "p009t1",
+                             min.features = 200,
+                             min.cells = 3)
+p009t2 <- CreateSeuratObject(counts = p009t2, 
+                             project = "p009t2",
+                             min.features = 200,
+                             min.cells = 3)
+p012t <- CreateSeuratObject(counts = p012t, 
+                             project = "p012t",
+                             min.features = 200,
+                             min.cells = 3)
+p014t <- CreateSeuratObject(counts = p014t, 
+                             project = "p014t",
+                             min.features = 200,
+                             min.cells = 3)
+p016t <- CreateSeuratObject(counts = p016t, 
+                             project = "p016t",
+                             min.features = 200,
+                             min.cells = 3)
+p017t <- CreateSeuratObject(counts = p017t, 
+                             project = "p017t",
+                             min.features = 200,
+                             min.cells = 3)
+```
+
+```{r}
+seurat_list <- list(p007t, p008t, p009t1, p009t2,p012t, p014t, p016t, p017t)
+```
+
+```{r}
+seurat <- merge(p007t, list(p008t, p009t1, p009t2,p012t, p014t, p016t, p017t), 
+                add.cell.ids = c("p007t", "p008t","p009t1", "p009t2",
+                                 "p012t", "p014t","p016t", "p017t"))
+```
+
+orig.ident didn't write correctly. I'll manually get it in there
+```{r}
+seurat$orig.ident <- c(rep("p007t", ncol(p007t)),
+                       rep("p008t", ncol(p008t)),
+                       rep("p009t1", ncol(p009t1)),
+                       rep("p009t2", ncol(p009t2)),
+                       rep("p012t", ncol(p012t)),
+                       rep("p014t", ncol(p014t)),
+                       rep("p016t", ncol(p016t)),
+                       rep("p017t", ncol(p017t)))
+
+Idents(seurat) <- seurat$orig.ident
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT.")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(log10(seurat$nCount_RNA), breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="orig.ident")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/colorectal_Uhlitz_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/colorectal_Uhlitz_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Uhlitz_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/colorectal_Uhlitz_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/colorectal_Uhlitz_meta.csv")
+```
+
+# Colorectal - Qian et al - http://blueprint.lambrechtslab.org
+```{r}
+mat <- Read10X("~/Data/single_cell_datasets/colorectal_qian/data/CRC_counts/")
+meta <- read.csv("~/Data/single_cell_datasets/colorectal_qian/data/CRC_metadata.csv", row.names=1)
+seurat <- CreateSeuratObject(mat, min.cells = 3, min.features = 200,
+                             meta.data = meta)
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+Already filtered
+
+```{r}
+seurat <- subset(seurat, subset = CellFromTumor == TRUE)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+#Fix sample factor levels
+seurat$orig.ident <- factor(seurat$orig.ident, levels=unique(seurat$orig.ident))
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="orig.ident")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/colorectal_Qian_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/colorectal_Qian_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Qian_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/colorectal_Qian_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/colorectal_Qian_meta.csv")
+```
+
+# Gastric - Sathe et al - https://dna-discovery.stanford.edu
+
+```{r}
+path <- "~/Data/single_cell_datasets/gastric_sathe/data/gastric_scRNAseq_filtered/"
+
+samples <- dir(path)
+```
+
+```{r}
+getSamples <- function(sampleID){
+  mat <- Read10X(paste0(path, sampleID))
+  seurat <- CreateSeuratObject(mat,
+                               min.cells=3,
+                               min.features=200,
+                               project = sampleID)
+  return(seurat)
+}
+```
+
+```{r}
+seurat_list <- lapply(samples, getSamples)
+```
+
+```{r}
+seurat <- merge(seurat_list[[1]], seurat_list[2:length(seurat_list)])
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+#Fix sample factor levels
+seurat$orig.ident <- factor(seurat$orig.ident, levels=unique(seurat$orig.ident))
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="orig.ident")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/gastric_sathe_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/gastric_sathe_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/gastric_sathe_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/gastric_sathe_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/gastric_sathe_meta.csv")
+```
+
+# Lung - Kim et al - GSE131907
+```{r}
+exp <- fread("~/Data/single_cell_datasets/lung_kim/data/raw_UMI_matrix.txt",
+                  sep="\t", header=T)
+meta <- fread("~/Data/single_cell_datasets/lung_kim/data/cell_annotation.txt",
+              sep="\t", header=T)
+```
+
+```{r}
+gene_list <- exp$Index
+cell_list <- colnames(exp)[2:ncol(exp)]
+exp <- as.matrix(exp[,2:ncol(exp)])
+exp <- as(exp, "dgCMatrix")
+rownames(exp) <- gene_list
+
+meta <- as.data.frame(meta)
+rownames(meta) <- meta$Index
+```
+
+```{r}
+samples_keep <- c("tLung", "tL/B", "mLN")
+cells_keep <- meta %>% 
+  filter(Sample_Origin %in% samples_keep) %>%
+  pull(Index)
+
+meta <- meta[cells_keep,]
+exp <- exp[,cells_keep]
+```
+
+```{r}
+seurat <- CreateSeuratObject(counts=exp,
+                             meta.data = meta,
+                             min.cells = 3,
+                             min.features = 200)
+
+rm(exp, meta, cell_list, gene_list)
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+Already filtered
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+#Fix sample factor levels
+seurat$orig.ident <- factor(seurat$orig.ident, levels=unique(seurat$orig.ident))
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Sample")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/lung_kim_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/lung_kim_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_kim_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/lung_kim_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Sample)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Sample[epi_index], "_Epi")
+meta$Sample <- NULL
+write.csv(meta, file="../output/tumour_annotations/lung_kim_meta.csv")
+```
+
+# Lung - Lambrechts et al - E-MTAB-6149 & E-MTAB-6653
+Had previously merged into seurat object
+
+```{r}
+seurat <- readRDS("~/Data/2018-lung-cancer/output/lung_cancer.rds")
+```
+
+```{r}
+seurat <- DietSeurat(seurat)
+seurat$percent.mito <- seurat$percent.mito * 100 #was previously proportion
+seurat <- subset(seurat, subset=percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+#Fix sample factor levels
+seurat$orig.ident <- factor(seurat$orig.ident, levels=unique(seurat$orig.ident))
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="orig.ident")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/lung_lambrechts_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/lung_lambrechts_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_lambrechts_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/lung_lambrechts_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/lung_lambrechts_meta.csv")
+```
+
+# Lung - Laughey et al - GSE123904
+Lots of individual samples
+
+```{r}
+file_names <- list.files("~/Data/single_cell_datasets/lung_laughney/data/")
+#Don't care about normal tissue
+file_names <- file_names[-grep("NORMAL", file_names)]
+file_dir <- "~/Data/single_cell_datasets/lung_laughney/data/"
+
+paths <- paste0(file_dir, file_names)
+
+
+exp_mats <- list()
+
+for(i in 1:length(paths)){
+  exp_mats[[i]] <- read.csv(paths[i], row.names=1)
+}
+
+
+for(i in 1:length(exp_mats)){
+  exp_mats[[i]] <- t(as.matrix(exp_mats[[i]]))
+}
+```
+
+Let's get some names for the each matrix
+
+```{r}
+annotation <- data.frame(file_name = file_names)
+annotation$file_name <- gsub("_dense.csv", "", annotation$file_name)
+annotation <- separate(annotation, col = file_name,
+                       into = c("Patient", "Location"))
+annotation$Sample <- gsub("_dense.csv", "", file_names)
+
+names(exp_mats) <- annotation$Sample
+```
+
+```{r}
+for(i in 1:length(exp_mats)){
+  exp_mats[[i]] <- as(exp_mats[[i]], "dgCMatrix")
+}
+
+seurat_list <- list()
+for(i in 1:length(exp_mats)){
+  seurat_list[[i]] <- CreateSeuratObject(exp_mats[[i]],
+                                         project = names(exp_mats)[i],
+                                         min.cells=3, min.features=200)
+  seurat_list[[i]][["percent.mito"]] <- PercentageFeatureSet(seurat_list[[i]],
+                                                             pattern="^MT.")
+}
+```
+
+Already filtered
+
+```{r}
+seurat <- merge(seurat_list[[1]], seurat_list[2:length(seurat_list)])
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat$Patient_small <- annotation$Patient[match(seurat$orig.ident, annotation$Sample)]
+seurat$Location <- annotation$Patient[match(seurat$orig.ident, annotation$Location)]
+
+seurat$Patient <- gsub("METASTASIS", "M", seurat$Patient)
+seurat$Patient <- gsub("PRIMARY_TUMOUR", "P", seurat$Patient)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/lung_laughney_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/lung_laughney_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_laughney_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/lung_laughney_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/lung_laughney_meta.csv")
+```
+
+# Lung - Qian et al - http://blueprint.lambrechtslab.org
+```{r}
+mat <- Read10X("~/Data/single_cell_datasets/lung_qian/data/LC_counts/")
+meta <- read.csv("~/Data/single_cell_datasets/lung_qian/data/lung_metadata.csv",
+                 row.names=1)
+seurat <- CreateSeuratObject(mat, min.cells = 3, min.features = 200,
+                             meta.data = meta)
+seurat$Patient <- Idents(seurat)
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/lung_qian_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/lung_qian_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_qian_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/lung_qian_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/lung_qian_meta.csv")
+```
+
+# Lung - Wu et al - GSE148071
+```{r}
+file_list <- list.files("~/Data/single_cell_datasets/lung_wu/data/")
+```
+
+```{r}
+makeSeurat <- function(filename){
+  mat <- read.table(paste0("~/Data/single_cell_datasets/lung_wu/data/", filename),
+                    row.names=1, header=T)
+  mat <- as.matrix(mat)
+  mat <- as(mat, "dgCMatrix")
+  seurat <- CreateSeuratObject(mat,
+                               min.cells=3,
+                               min.features=200)
+  seurat$orig.ident <- gsub("_exp.txt", "", filename)
+  
+  return(seurat)
+}
+```
+
+```{r}
+seurat_list <- lapply(file_list, makeSeurat)
+seurat <- merge(seurat_list[[1]], seurat_list[2:length(seurat_list)])
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+seurat$Sample <- seurat$orig.ident
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(log10(seurat$nCount_RNA), breaks=100)
+```
+
+Already filtered at 30%. Seems like a heavy tail. I really don't want to cut it down to 20%
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Sample")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+#seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/lung_wu_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/lung_wu_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_wu_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/lung_wu_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/lung_wu_meta.csv")
+```
+
+# Ovarian - Geistlinger et al - GSE154600
+```{r}
+ovca59_mat <- Read10X("~/Data/single_cell_datasets/ovarian_starr_lab/data/59/")
+ovca76_mat <- Read10X("~/Data/single_cell_datasets/ovarian_starr_lab/data/76/")
+ovca77_mat <- Read10X("~/Data/single_cell_datasets/ovarian_starr_lab/data/77/")
+ovca89_mat <- Read10X("~/Data/single_cell_datasets/ovarian_starr_lab/data/89/")
+ovca90_mat <- Read10X("~/Data/single_cell_datasets/ovarian_starr_lab/data/90/")
+
+ovca59 <- CreateSeuratObject(ovca59_mat,
+                             project = "OVCA_59",
+                             min.features = 200,
+                             min.cells = 3)
+
+ovca76 <- CreateSeuratObject(ovca76_mat,
+                             project = "OVCA_76",
+                             min.features = 200,
+                             min.cells = 3)
+
+ovca77 <- CreateSeuratObject(ovca77_mat,
+                             project = "OVCA_77",
+                             min.features = 200,
+                             min.cells = 3)
+
+ovca89 <- CreateSeuratObject(ovca89_mat,
+                             project = "OVCA_89",
+                             min.features = 200,
+                             min.cells = 3)
+
+ovca90 <- CreateSeuratObject(ovca90_mat,
+                             project = "OVCA_90",
+                             min.features = 200,
+                             min.cells = 3)
+
+seurat <- merge(ovca59, list(ovca76, ovca77, ovca89, ovca90))
+
+rm(ovca59, ovca76, ovca77, ovca89, ovca90)
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="orig.ident")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/ovarian_geistlinger_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/ovarian_geistlinger_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_geistlinger_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/ovarian_geistlinger_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/ovarian_geistlinger_meta.csv")
+```
+
+# Ovarian - Qian et al - http://blueprint.lambrechtslab.org
+```{r}
+mat <- Read10X("~/Data/single_cell_datasets/ovarian_qian/data/OvC_counts/")
+meta <- read.csv("~/Data/single_cell_datasets/ovarian_qian/data/OvC_metadata.csv",
+                 row.names=1)
+seurat <- CreateSeuratObject(mat, min.cells = 3, min.features = 200,
+                             meta.data = meta)
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+seurat$Patient <- Idents(seurat)
+seurat <- subset(seurat, subset = CellFromTumor == 1) #remove non-tumour samples
+seurat$Patient <- factor(seurat$Patient) # fix Patient factor
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/ovarian_qian_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/ovarian_qian_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_qian_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/ovarian_qian_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/ovarian_qian_meta.csv")
+```
+
+# PDAC - Steele et al - GSE155698
+```{r}
+path <- "~/Data/single_cell_datasets/pdac_steele/data/"
+dirs <- dir(path)
+dirs <- dirs[-c(7, 9)] #PDAC_TISSUE_14 is just an h5 file--we'll read it in separately
+#PDAC_TISSUE_14 isn't gzipped and it seems to cause an issue. Will deal with it separately too
+```
+
+```{r}
+mat_list <- lapply(paste0(path,dirs, "/filtered_feature_bc_matrix"), Read10X)
+```
+
+Add the extras
+
+```{r}
+pdac14 <- Read10X_h5(paste0(path, "PDAC_TISSUE_14/filtered_feature_bc_matrix.h5"))
+pdac16 <- Read10X_h5(paste0(path, "PDAC_TISSUE_16/filtered_gene_bc_matrices_h5.h5"))
+mat_list <- c(mat_list, list(pdac14, pdac16))
+```
+
+```{r}
+seurat_list <- lapply(mat_list, CreateSeuratObject,
+                      min.cells=3)
+```
+
+```{r}
+seurat <- merge(seurat_list[[1]], seurat_list[2:length(seurat_list)],
+                add.cell.ids = c(dirs, "PDAC_TISSUE_16", "PDAC_TISSUE_14"))
+```
+
+```{r}
+seurat$percent.mito <- PercentageFeatureSet(seurat, pattern = "^MT-")
+VlnPlot(seurat, features = c("percent.mito"))
+```
+
+Oops, orig.ident didn't get set. Annoying
+
+```{r}
+sample_names <- c(dirs, "PDAC_TISSUE_16", "PDAC_TISSUE_14")
+seurat$Sample <- rep(sample_names,
+                     unlist(lapply(mat_list, ncol)))
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito <= 20 & nFeature_RNA >= 200)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Sample")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/pdac_steele_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Sample")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/pdac_steele_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/pdac_steele_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/pdac_steele_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Sample)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Sample[epi_index], "_Epi")
+meta$Sample <- NULL
+write.csv(meta, file="../output/tumour_annotations/pdac_steele_meta.csv")
+```
+
+# Breast - Wu et al - ENA PRJEB35405
+```{r}
+meta <- read.csv("~/Data/single_cell_datasets/breast_wu/data/Wu_EMBO_metadata.csv", row.names=1)
+meta <- as.data.frame(meta[2:nrow(meta),])
+meta$percent.mito <- as.numeric(meta$percent.mito)
+meta$nCount_RNA <- as.numeric(meta$nCount_RNA)
+meta$nFeature_RNA <- as.numeric(meta$nFeature_RNA)
+
+
+counts <- read.csv("~/Data/single_cell_datasets/breast_wu/data/Wu_EMBO_countr_matrix.csv", row.names=1)
+counts <- as.matrix(counts)
+counts <- as(counts, "dgCMatrix")
+```
+
+```{r}
+seurat <- CreateSeuratObject(counts,
+                             meta.data = meta,
+                             min.cells=3, min.features=200)
+```
+
+```{r}
+seurat$Patient <- seurat$patientID
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/breast_wu_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/breast_wu_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_wu_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/breast_wu_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/breast_wu_meta.csv")
+```
+
+# Breast - Qian et al - http://blueprint.lambrechtslab.org
+```{r}
+mat <- Read10X("~/Data/single_cell_datasets/breast_qian/data/BC_counts/")
+meta <- read.csv("~/Data/single_cell_datasets/breast_qian/data/breast_metadata.csv",
+                 row.names=1)
+seurat <- CreateSeuratObject(mat, min.cells = 3, min.features = 200,
+                             meta.data = meta)
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+seurat$Patient <- factor(Idents(seurat))
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/breast_qian_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/breast_qian_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_qian_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/breast_qian_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/breast_qian_meta.csv")
+```
+
+# Breast - Bassez et al - http://biokey.lambrechtslab.org/
+```{r}
+cohort1 <- readRDS("~/Data/single_cell_datasets/breast_bassez/data/1863-counts_cells_cohort1.rds")
+cohort2 <- readRDS("~/Data/single_cell_datasets/breast_bassez/data/1867-counts_cells_cohort2.rds")
+meta1 <- read.csv("~/Data/single_cell_datasets/breast_bassez/data/1872-BIOKEY_metaData_cohort1_web.csv",
+                  row.names=1)
+meta2 <- read.csv("~/Data/single_cell_datasets/breast_bassez/data/1871-BIOKEY_metaData_cohort2_web.csv",
+                  row.names=1)
+```
+
+```{r}
+cohort1 <- CreateSeuratObject(cohort1,
+                              meta = meta1,
+                              min.cells=3,
+                              min.features=200)
+cohort2 <- CreateSeuratObject(cohort2,
+                              meta = meta2,
+                              min.cells=3,
+                              min.features=200)
+```
+
+Could probably merge the two cohorts, but since that could result in an unnecessary batch effect, I might as well just process them independently
+## Cohort 1 - Treatment naive
+```{r}
+seurat <- cohort1
+seurat$Patient <- seurat$orig.ident
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(log10(seurat$nCount_RNA), breaks=100)
+```
+
+This population with low UMI counts leads to a lot of noise at the center of the UMAP. I'm going to trim anything <750 UMIs to get rid of most of those low quality cells
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20 & nCount_RNA > 750)
+```
+
+### Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+### Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+#seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+
+#SCTransform is actually crashing for this data set. We'll just use log transformation here
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+### Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/breast_bassez_cohort1_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/breast_bassez_cohort1_seurat.rds")
+```
+
+### InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort1_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/breast_bassez_cohort1_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/breast_bassez_cohort1_meta.csv")
+```
+
+## Cohort 2 - Neoadjuvant chemotherapy
+```{r}
+seurat <- cohort2
+seurat$Patient <- seurat$orig.ident
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20)
+```
+
+### Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+### Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+### Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/breast_bassez_cohort2_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="orig.ident")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/breast_bassez_cohort2_seurat.rds")
+```
+
+### InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort2_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/breast_bassez_cohort2_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, orig.ident)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$orig.ident[epi_index], "_Epi")
+meta$orig.ident <- NULL
+write.csv(meta, file="../output/tumour_annotations/breast_bassez_cohort2_meta.csv")
+```
+
+# SCC - Ji et al - GSE144236
+```{r}
+exp <- as.matrix(read.table("~/Data/single_cell_datasets/scc_ji/data/GSE144236_cSCC_counts.txt", row.names=1))
+meta <- read.table("~/Data/single_cell_datasets/scc_ji/data/patient_metadata_new.txt", sep = "\t", row.names=1)
+```
+
+```{r}
+exp <- as(exp, "dgCMatrix")
+exp <- exp[3:nrow(exp),] # row 1 = patient #, row 2 = tumor or normal
+```
+
+```{r}
+seurat <- CreateSeuratObject(exp, min.cells=3)
+seurat$tum.norm <- meta$tum.norm
+seurat$level1_celltype <- meta$level1_celltype
+seurat$level2_celltype <- meta$level2_celltype
+seurat$level3_celltype <- meta$level3_celltype
+seurat$Patient <- meta$patient
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=50)
+```
+
+```{r}
+seurat <- subset(seurat, subset = percent.mito < 20 & tum.norm == "Tumor" &
+                   nFeature_RNA > 200)
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/scc_ji_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/scc_ji_seurat.rds")
+```
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/scc_ji_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/scc_ji_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/scc_ji_meta.csv")
+```
+
+# Uveal Melanoma - Durante et al - GSE139829
+```{r}
+umm041L <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM041L/")
+umm059 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM059/")
+umm061 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM061/")
+umm062 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM062/")
+umm063 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM063/")
+umm064 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM064/")
+umm065 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM065/")
+umm066 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM066/")
+umm067L <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM067L/")
+umm069 <- Read10X("~/Data/single_cell_datasets/uveal_melanoma_durante/data/UMM069/")
+```
+
+```{r}
+umm041L <- CreateSeuratObject(counts = umm041L, 
+                             project = "umm041L",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm059 <- CreateSeuratObject(counts = umm059, 
+                             project = "umm059",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm061 <- CreateSeuratObject(counts = umm061, 
+                             project = "umm061",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm062 <- CreateSeuratObject(counts = umm062, 
+                             project = "umm062",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm063 <- CreateSeuratObject(counts = umm063,
+                             project = "umm063",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm064 <- CreateSeuratObject(counts = umm064, 
+                             project = "umm064",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm065 <- CreateSeuratObject(counts = umm065, 
+                             project = "umm065",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm066 <- CreateSeuratObject(counts = umm066, 
+                             project = "umm066",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm067L <- CreateSeuratObject(counts = umm067L, 
+                             project = "umm067L",
+                             min.features = 200,
+                             min.cells = 3)
+
+umm069 <- CreateSeuratObject(counts = umm069, 
+                             project = "umm069",
+                             min.features = 200,
+                             min.cells = 3)
+```
+
+```{r}
+seurat <- merge(umm041L, list(umm059, umm061, umm062, umm063,
+                              umm064, umm065, umm065, umm066,
+                              umm067L, umm069))
+```
+
+```{r}
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+seurat$Patient <- seurat$orig.ident
+seurat <- subset(seurat, subset = percent.mito < 20 & Patient != "umm065") #40k cells! can't use
+```
+
+## Doublet removal
+```{r}
+seurat <- NormalizeData(seurat)
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- NormalizeData(seurat)
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- SCTransform(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/uveal_durante_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/uveal_durante_seurat.rds")
+```
+
+# Nasopharyngeal Carcinoma - Chen et al - GSE150430
+
+```{r}
+mat <- read.table("~/Data/single_cell_datasets/npc_chen/data/GSE150430_npc_scRNA_hg19_processed_data.txt",
+                  row.names=1, header=T)
+cell_types <- data.frame(CellType = as.character(mat[1,]))
+rownames(cell_types) <- colnames(mat)
+
+mat <- as.matrix(mat[2:nrow(mat), ])
+mat <- as(mat, "dgCMatrix")
+```
+
+```{r}
+seurat <- CreateSeuratObject(mat,
+                             min.cells=3,
+                             min.features=200)
+seurat <- subset(seurat, subset = orig.ident != "N01")
+seurat$orig.ident <- factor(seurat$orig.ident) #relevel now that N01 is gone
+seurat$CellType_original <- cell_types[colnames(seurat),]
+```
+
+```{r}
+seurat$Patient <- seurat$orig.ident
+seurat[["percent.mito"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+```
+
+```{r}
+hist(seurat$percent.mito, breaks=100)
+hist(seurat$nCount_RNA, breaks=100)
+```
+All percent.mt values are really low. No filtering needed
+
+## Doublet removal
+```{r}
+#UMIs were not provided. Values are log-transformed. Moving into @data
+seurat[["RNA"]]@data <- seurat[["RNA"]]@counts
+```
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat))
+sce <- scDblFinder(sce, samples="Patient")
+```
+
+```{r}
+seurat$Doublet <- sce$scDblFinder.class
+```
+
+```{r}
+seurat <- subset(seurat, subset = Doublet == "singlet")
+```
+
+## Process
+
+```{r, results = 'hide'}
+seurat <- CellCycleScoring(seurat, s.features = cc.genes.updated.2019$s.genes,
+                           g2m.features = cc.genes.updated.2019$g2m.genes)
+seurat <- FindVariableFeatures(seurat) #Can't use SCTransform because we don't have their UMI data
+seurat <- ScaleData(seurat, vars.to.regress=c("S.Score", "G2M.Score", "percent.mito"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:35)
+seurat <- FindNeighbors(seurat, dims=1:35)
+seurat <- FindClusters(seurat, resolution=0.3)
+DefaultAssay(seurat) <- "RNA"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+```
+
+## Automated annotation
+
+```{r}
+sce <- as.SingleCellExperiment(DietSeurat(seurat), assay="RNA")
+pred <- SingleR(test = sce, ref = ref, labels = ref$label.main)
+
+saveRDS(pred, file="../output/tumour_annotations/npc_chen_singleR.rds")
+```
+
+```{r}
+seurat$CellType <- pred$pruned.labels
+seurat$CellType[is.na(seurat$CellType)] <- "Unknown"
+```
+
+```{r}
+DimPlot(seurat, label=T)
+DimPlot(seurat, group.by="Patient")
+DimPlot(seurat, group.by="CellType", label=T)
+```
+
+```{r}
+saveRDS(seurat, file="../output/tumour_annotations/npc_chen_seurat.rds")
+```
+
+
+## InferCNV setup
+```{r}
+seurat <- readRDS("../output/tumour_annotations/npc_chen_seurat.rds")
+#Count matrix
+saveRDS(seurat[["RNA"]]@counts,
+        file="../output/tumour_annotations/npc_chen_counts.rds")
+
+#Cell annotations
+meta <- seurat@meta.data %>%
+  select(CellType, Patient)
+epi_index <- meta$CellType == "Epithelial_cells"
+meta$CellType[epi_index] <- paste0(meta$Patient[epi_index], "_Epi")
+meta$Patient <- NULL
+write.csv(meta, file="../output/tumour_annotations/npc_chen_meta.csv")
+```
+
+
+
+

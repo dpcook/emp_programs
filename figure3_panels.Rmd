@@ -1,0 +1,235 @@
+---
+title: "Figure 3 Panels"
+output: html_notebook
+---
+
+# Dependencies
+```{r}
+library(Seurat)
+library(tidyverse)
+library(pheatmap)
+library(ggrastr)
+library(ggridges)
+library(survival)
+library(survminer)
+```
+
+
+# Fig 3A - Gene specificity scores
+```{r}
+spec_score_mat <- read.csv("../../../output/specificity_score_matrix.csv", row.names = 1)
+spec_score_mat <- as.matrix(spec_score_mat)
+```
+
+```{r}
+spec_score_heat <- pheatmap::pheatmap(t(spec_score_mat),
+         #color = colorRampPalette(c("white", "firebrick"))(100),
+         color = viridis::inferno(100),
+         breaks = seq(0, 0.25, length.out=101),
+         border_color = "NA",
+         cluster_cols=T,
+         cluster_rows=F,
+         clustering_method="ward.D",
+         treeheight_col = 35,
+         cutree_cols = 16,
+         show_colnames=F,
+         fontsize = 14,
+         #angle_col = 45,
+         legend=F,
+         filename = "emt_sig_avg_specificity.png",
+         width=10, height=3.5,
+         dpi=600)
+```
+
+
+# Fig 3B - PDAC scoring
+```{r}
+seurat <- readRDS("~/Data/single_cell_datasets/pdac_peng/output/seurat_processed.rds")
+```
+
+## UMAP
+```{r}
+dat <- seurat@meta.data
+dat$UMAP1 <- Embeddings(seurat, 'umap')[,1]
+dat$UMAP2 <- Embeddings(seurat, 'umap')[,2]
+```
+
+```{r}
+options(ggrastr.default.dpi=450)
+dat_plot_refined <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point_rast(size=0.1, shape=16, alpha=0.5, aes(color=EMP_Refined)) +
+  #scale_color_gradientn(colours=c("lightgrey", "red"))+
+  scale_color_gradientn(colours=viridis::mako(100),
+                        name="Refined EMP\nsignature\nAUCell score",
+                         guide = guide_colorbar(ticks.colour = "black",
+                                              frame.colour = "black",
+                                              barwidth=0.75))+
+  theme_void() +
+  theme(legend.title=element_text(size=10),
+        legend.text=element_text(size=10))
+ggsave(dat_plot_refined, filename="pdac_umap_emp_sig_refined.pdf",
+       device=cairo_pdf(), width=3.25, height=2)
+dat_plot_refined
+```
+
+## Violin
+```{r}
+dat <- seurat@meta.data
+dat$CellType_Broad[dat$CellType_Broad == "Epithelial_cells"] <- "Malignant cells"
+dat$CellType_Broad <- factor(dat$CellType_Broad, levels=c("Malignant cells", "Endothelial_cells",
+                                              "Fibroblasts", "Smooth_muscle_cells", 
+                                              "Monocyte", "Macrophage", "T_cells",
+                                              "B_cell", "NK_cell", "DC", "Unknown"))
+
+dat_plot <- ggplot(dat, aes(EMP_Refined, CellType_Broad)) +
+  geom_density_ridges(aes(fill=CellType_Broad), alpha=0.5) +
+  xlab("Refined EMP signature\nAUCell score") + ylab("") +
+  theme_ridges() +
+  theme(legend.position="none",
+        axis.title.x=element_text(size=12),
+        axis.text.x=element_text(size=12))
+ggsave(dat_plot, filename="pdac_ridges_emp_sig_refined.pdf",
+       width=4, height=2.75)
+dat_plot
+```
+
+
+
+# Fig 3C - TCGA PFI
+
+See tcga_analysis.Rmd to see how this data frame was generated.
+
+```{r}
+clinical_dat <- read.csv("../../../output/tcga_clinical_emp.csv", row.names = 1)
+```
+
+```{r}
+coxph(Surv(PFS.time, PFS)~EMP + Type + Age + Purity + Stage_Broad, data=clinical_dat)
+```
+
+## Cancer ridge plots
+```{r}
+dat_plot <- ggplot(clinical_dat, aes(x=EMP, y=Type)) +
+  geom_density_ridges_gradient(aes(fill=stat(x)),
+                               quantile_lines=T, quantiles=2, alpha=0.5) +
+  scale_fill_viridis(option="G") +
+  ylab("Cancer type") + xlab("Relative expression of refined EMP signature") +
+  theme_ridges() +
+  theme(legend.position="none")
+dat_plot
+
+ggsave(dat_plot, filename="pan_cancer_tcga_emp_score.pdf",
+       width=5, height=4)
+```
+
+## HR for each tumour type
+```{r}
+testCancer <- function(cancer){
+  dat <- subset(clinical_dat, Type == cancer)
+  res <- coxph(Surv(PFS.time, PFS)~EMP + Age + Purity + Stage_Broad, data=dat)
+  res <- summary(res)
+  
+  res <- data.frame(HR = res$conf.int[1,1],
+                    se = res$coefficients[1,3],
+                    pval = res$coefficients[1,5],
+                    Cancer = cancer)
+  return(res)
+}
+cancer_list <- unique(clinical_dat$Type)
+
+cancer_res <- lapply(cancer_list, testCancer)
+cancer_res <- do.call("rbind", cancer_res)
+```
+
+## LUAD Kaplan
+```{r}
+luad <- filter(clinical_dat, Type == "LUAD")
+luad$EMP_binary <- ifelse(luad$EMP > median(luad$EMP),
+                          "High", "Low")
+sfit <- survfit(Surv(PFS.time, PFS)~EMP_binary, data=luad)
+```
+
+```{r}
+surv_plot <- ggsurvplot(sfit, conf.int=F, pval=TRUE, 
+           legend.labs=c("High", "Low"), legend.title="EMP",  
+           palette=c("firebrick", "grey50"))
+surv_plot
+```
+
+```{r}
+ggsave(surv_plot$plot, filename="luad_survival.pdf",
+       height=3, width=3.5)
+```
+
+
+# Fig 3D - TCGA Immune prop
+```{r}
+immune_proportions <- read.csv("../../../output/tcga_immune_composition_emp.csv")
+```
+
+
+```{r}
+testEMP <- function(cell_type){
+  score <- immune_proportions[,cell_type]
+  
+  model_res <- summary(lm(score ~ immune_proportions$EMP_Score + immune_proportions$TCGA.Study))
+  res <- data.frame(Coef = model_res$coefficients[2,1],
+                    pval = model_res$coefficients[2,4],
+                    CellType = cell_type)
+}
+```
+
+```{r}
+cell_type_list <- colnames(immune_proportions)[4:25]
+```
+
+```{r}
+cell_type_list
+```
+
+```{r}
+#Can log transform proportions to make them a little more normally distributed
+immune_proportions[,cell_type_list] <- log(immune_proportions[,cell_type_list] + 0.01)
+
+prop_res <- lapply(cell_type_list, testEMP)
+prop_res <- do.call("rbind", prop_res)
+prop_res$padj <- p.adjust(prop_res$pval, method="BH")
+
+#order
+prop_res <- prop_res %>%
+  arrange(Coef)
+prop_res$CellType <- factor(prop_res$CellType, levels=prop_res$CellType)
+
+#Prep colors
+prop_res$Sig <- ifelse(prop_res$padj <= 0.05, "Sig", "No change")
+prop_res$Sig[prop_res$Sig == "Sig" & prop_res$Coef > 0] <- "Significant increase"
+prop_res$Sig[prop_res$Sig == "Sig" & prop_res$Coef < 0] <- "Significant decrease"
+prop_res$Sig <- factor(prop_res$Sig,
+                       levels = c("Significant decrease",
+                                  "No change",
+                                  "Significant increase"))
+```
+
+```{r}
+cols <- rev(RColorBrewer::brewer.pal(7, "RdBu"))
+
+
+celltype_plot <- ggplot(prop_res, aes(x=Coef, y = CellType)) +
+  geom_point(aes(size=-log10(padj), fill=Sig), shape=21, color="black") +
+  geom_vline(xintercept = 0, linetype=2) +
+  scale_fill_manual(values=c(cols[1], "grey20", cols[7])) +
+  xlab("Change in proportion with\nEMP program activity") + ylab("") +
+  theme_classic() +
+  theme(axis.text.y=element_text(size=12, color="black"),
+        axis.text.x=element_text(size=10, color="black"),
+        axis.title=element_text(size=12),
+         legend.text=element_text(size=12),
+        legend.title=element_text(size=14))
+ggsave(celltype_plot, filename="pan_cancer_tcga_immune_proportions.pdf",
+       device=cairo_pdf(), width=7, height=4.5)
+
+celltype_plot
+```
+
+
+

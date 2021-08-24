@@ -1,0 +1,226 @@
+---
+title: "Figure S4 - EMT sig correlation with UMI/mito"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+```
+
+# Load the data
+```{r}
+seurat <- readRDS("../../../data/pan_cancer_epi.rds")
+meta_list <- readRDS("../../../output/master_metadata.rds")
+emt_genes <- readLines("../../../output/conserved_emt_signature.txt")
+emt_programs <- readLines("../../../output/emp_program_list_broad.txt")
+program_scores <- read.csv("../../../output/archetype_program_scores.csv")
+```
+
+```{r}
+tech_factors <- c("nCount_RNA", "percent.mito")
+```
+
+# Get correlation
+```{r}
+getCor <- function(df){
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  cor_mat <- cor(df[,total_arch], df[,tech_factors])
+}
+
+cor_list <- lapply(meta_list, getCor)
+```
+
+```{r}
+for(i in 1:length(cor_list)){
+  rownames(cor_list[[i]]) <- paste0(names(meta_list)[i], "_", rownames(cor_list[[i]]))
+}
+```
+
+```{r}
+cor_list_merge <- do.call("rbind", cor_list)
+```
+
+```{r}
+emp_programs <- readLines("../../../output/emp_program_list_broad.txt")
+```
+
+```{r}
+cor_df <- as.data.frame(cor_list_merge)
+colnames(cor_df) <- c("UMI", "Mito")
+cor_df$EMP <- rownames(cor_list_merge) %in% emp_programs
+```
+
+```{r}
+emp_df <- filter(cor_df, EMP == T) %>%
+  pivot_longer(col=-EMP, names_to = "Variable", values_to="Correlation")
+```
+
+```{r}
+variable_plot <- ggplot(emp_df, aes(x=Variable, y=Correlation)) +
+  geom_boxplot(color="black", fill="firebrick", alpha=0.86) +
+  scale_y_continuous(limits=c(min(emp_df$Correlation),1)) +
+  ylab("EMP program correlation") +
+  theme_classic() +
+  theme(axis.text.x=element_text(size=12, angle=45, hjust=1, color="black"),
+        axis.text.y=element_text(size=10, color="black"),
+        axis.title=element_text(size=14))
+variable_plot
+```
+
+```{r}
+ggsave(variable_plot, filename="var_correlation.pdf",
+       width=2, height=3)
+```
+
+
+```{r}
+emp_df %>% group_by(Variable) %>% summarise(Median = median(Correlation))
+```
+ 
+# Fig S4B - Cancer specificity (ANOVA)
+Goal here to see if genes are associated with specific cancer types
+
+
+```{r}
+cancer_dat <- program_scores %>% filter(Program %in% emt_programs)
+cancer_dat$Cancer <- stringr::word(cancer_dat$Program, start=1, end=1, sep="_")
+```
+
+Hm, now, the challenge is that genes are not actually tested in all tumours. Do we only model genes in samples that they were explicitly tested or assume coef=0 if it's not detected. Actually, the problem of setting coef=0 is that it could artificially shrink variance. I think it's best to only go with the coefs we have.
+
+```{r}
+testCancer <- function(gene){
+  df <- filter(cancer_dat, Gene == gene)
+  res <- lm(df$coef ~ df$Cancer)
+  res <- anova(res)
+  res <- data.frame(Gene = gene,
+                    pval = res$`Pr(>F)`[1])
+}
+
+cancer_res <- lapply(emt_genes, testCancer)
+cancer_res <- do.call("rbind", cancer_res)
+cancer_res$padj <- p.adjust(cancer_res$pval, method="BH")
+```
+
+```{r}
+cancer_spec_genes <- cancer_res %>% filter(padj <= 0.05) %>% pull(Gene)
+cancer_spec_genes
+```
+
+Now, we'll make a heatmap of genes x cancer type
+
+```{r}
+cancer_specific <- cancer_dat %>%
+  filter(Gene %in% cancer_spec_genes) %>%
+  group_by(Gene, Cancer) %>%
+  summarise(Avg_coef = mean(coef)) %>%
+  pivot_wider(names_from = Cancer,
+              values_from = Avg_coef)
+
+coef_mat <- as.matrix(cancer_specific[,2:ncol(cancer_specific)])
+rownames(coef_mat) <- cancer_specific$Gene
+
+```
+
+```{r}
+pheatmap::pheatmap(t(coef_mat),
+                   clustering_method = "ward.D2",
+                   color = colorRampPalette(rev(RColorBrewer::brewer.pal(7, "RdBu")))(100),
+                   breaks = seq(-1, 1, length.out=101),
+                   border_color="black",
+                   treeheight_col=15,
+                   treeheight_row=15,
+                   legend=F,
+                   filename = "cancer_anova_coef.pdf",
+                   width=14, height=2.6)
+```
+
+# Figure S4C - Downregulated genes
+```{r}
+gene_counts <- program_scores %>%
+  filter(Program %in% emt_programs & padj <= 0.05 & coef < -1) %>%
+  group_by(Gene) %>%
+  summarise(Count = n(), avg_coef = mean(coef)) %>% 
+  arrange(desc(Count))
+gene_counts$Rank <- 1:nrow(gene_counts)
+```
+
+```{r}
+plot(gene_counts$Count)
+abline(h=10)
+```
+
+```{r}
+emt_sig <- gene_counts %>%
+  filter(Count >= 10) %>%
+  pull(Gene)
+length(emt_sig)
+```
+
+```{r}
+gene_counts_up <- program_scores %>%
+  filter(Program %in% emt_programs & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef > 1) %>%
+  group_by(Gene) %>%
+  summarise(Count_Up = length(Program)) %>%
+  arrange(desc(Count_Up))
+
+
+gene_counts_down<- program_scores %>%
+  filter(Program %in% emt_programs & Gene %in% emt_sig) %>%
+  filter(padj <= 0.05 & coef < -1) %>%
+  group_by(Gene) %>%
+  summarise(Count_Down = length(Program)) %>%
+  arrange(desc(Count_Down))
+
+gene_counts <- left_join(gene_counts_up, gene_counts_down,
+                         by="Gene")
+gene_counts$Count_Down[is.na(gene_counts$Count_Down)] <- 0
+
+gene_counts$Diff <- gene_counts$Count_Up - gene_counts$Count_Down
+
+gene_counts$Down <- ifelse(gene_counts$Diff < 0, "Down", "Up")
+```
+
+```{r}
+labels <- c("STMN1", "PGC", "TOP2A", "MKI67", "FABP5", "REG1A", "HMGB2", "RANBP1")
+gene_counts$Label <- ""
+gene_counts$Label[match(labels, gene_counts$Gene)] <- labels
+```
+
+
+```{r}
+diff_plot <- ggplot(gene_counts, aes(x=Count_Down, y=Count_Up, label=Label)) +
+  geom_point(aes(color=Down), size=2) +
+  geom_abline(slope=1, intercept = 0, linetype=2) +
+  geom_vline(xintercept=10, linetype=2) +
+  geom_text_repel(colour="black",
+                  max.overlaps = Inf,
+                  min.segment.length=0,
+                  direction="both",
+                  xlim = c(10, NA),
+                  size=4,
+                  nudge_y = 10,
+                  hjust=0,
+                  segment.size=0.2,
+                  segment.alpha=0.75,
+                  segment.color="black") +
+  scale_y_continuous(limits=c(0, max(gene_counts$Count_Up+5)), expand=c(0,0)) +
+  scale_x_continuous(limits=c(0, max(gene_counts$Count_Down+5)), expand=c(0,0)) +
+  scale_color_manual(values=c("firebrick", "lightgrey")) +
+  xlab("# of programs downregulated") + ylab("# of programs upregulated") +
+  theme_classic() +
+  theme(legend.position="none",
+        axis.text=element_text(size=12, color="black"),
+        axis.title=element_text(size=14, color="black"))
+  
+diff_plot
+```
+
+```{r}
+ggsave(diff_plot, filename="downregulated_genes.pdf",
+       width=5, height=3.5)
+```
+

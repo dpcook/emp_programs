@@ -1,0 +1,199 @@
+---
+title: "Figure S3 Panels"
+output: html_notebook
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggrastr)
+```
+
+```{r}
+seurat <- readRDS("~/Data/single_cell_datasets/mix_seq/output/seurat_processed.rds")
+meta_list <- readRDS("../../../output/master_metadata_mixseq.rds")
+```
+
+```{r}
+seurat <- subset(seurat, subset = Drug %in% c("Untreated", "DMSO", "Trametinib"))
+seurat$Drug[seurat$Drug %in% c("Untreated", "DMSO")] <- "Control"
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:30)
+```
+
+```{r}
+DimPlot(seurat, group.by="Drug")
+```
+
+# Mix-seq UMAP
+```{r}
+dat <- seurat@meta.data
+dat$UMAP1 <- Embeddings(seurat, 'umap')[,1]
+dat$UMAP2 <- Embeddings(seurat, 'umap')[,2]
+```
+
+
+```{r}
+options(ggrastr.default.dpi=600)
+cancer_plot <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point_rast(size=0.01, shape=16, alpha=0.75, aes(color=Drug)) +
+  scale_colour_manual(values=c("grey20", "firebrick")) +
+  guides(colour = guide_legend(override.aes = list(size=4))) +
+  theme_void() +
+  theme(legend.title=element_blank(),
+        legend.text = element_text(size=12))
+cancer_plot
+```
+
+```{r}
+ggsave(cancer_plot, filename="mix_seq_umap.pdf", 
+       width=5, height=3.25)
+```
+
+# Heatmap of EMP Programs
+```{r}
+emt_names <- c("CancerSEA", "Hallmark", "GO", 
+                     "Cook", "dbEMT", "Puram_pEMT", "Taube",
+                     "Kinker_I", "Kinker_II", "Kinker_III", "EMP_Sig")
+```
+
+```{r}
+getCor <- function(df){
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  cor_mat <- cor(df[,total_arch], df[,emt_names])
+}
+
+cor_list <- lapply(meta_list, getCor)
+```
+
+```{r}
+cor_list_merge <- cor_list
+for(i in 1:length(cor_list_merge)){
+  rownames(cor_list_merge[[i]]) <- paste0(names(cor_list_merge)[i], "_", rownames(cor_list_merge[[i]]))
+}
+cor_list_merge <- do.call("rbind", cor_list_merge)
+```
+
+```{r}
+emt_cor_heatmap <- pheatmap::pheatmap(t(cor_list_merge),
+                                      color = colorRampPalette(rev(RColorBrewer::brewer.pal(7, "RdBu")))(100),
+                                      breaks=seq(-0.75, 0.75, length.out=101),
+                                      cluster_rows=T,
+                                      cluster_cols=T,
+                                      show_colnames=F,
+                                      cutree_col=3,
+                                      fontsize = 14,
+                                      legend=F,
+                                      clustering_method="ward.D2",
+                                      filename="mixseq_archetype_emt_correlation_all.png",
+                                      width=8, height=4.25)
+```
+
+Get cluster numbers
+```{r}
+clusters <- as.data.frame(cutree(emt_cor_heatmap$tree_col, k=3))
+colnames(clusters) <- "Cluster"
+clusters$Program <- rownames(clusters)
+table(clusters$Cluster)
+```
+
+
+# Cook scRNA-seq
+## Prep data
+
+```{r}
+a549 <- readRDS("~/Projects/emt_dynamics/data/A549_Kinase_Untreated.rds")
+du145 <- readRDS("~/Projects/emt_dynamics/data/DU145_Kinase_Untreated.rds")
+mcf7 <- readRDS("~/Projects/emt_dynamics/data/MCF7_Kinase_Untreated.rds")
+ovca420 <- readRDS("~/Projects/emt_dynamics/data/OVCA420_Kinase_Untreated.rds")
+```
+
+```{r}
+seurat <- merge(a549, list(du145, mcf7, ovca420))
+```
+
+```{r}
+seurat <- subset(seurat, subset = Drug %in% c("Uninhibited_Untreated", "LY364947"))
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat, vars.to.regress=c("percent.mito", "S.Score", "G2M.Score"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:30)
+```
+
+
+## UMAP
+```{r}
+dat <- seurat@meta.data
+dat$UMAP1 <- Embeddings(seurat, 'umap')[,1]
+dat$UMAP2 <- Embeddings(seurat, 'umap')[,2]
+dat$Drug[dat$Drug == "Uninhibited_Untreated"] <- "Control"
+```
+
+
+```{r}
+options(ggrastr.default.dpi=600)
+cancer_plot <- ggplot(dat, aes(UMAP1, UMAP2)) +
+  geom_point_rast(size=0.5, shape=16, alpha=0.75, aes(color=Drug)) +
+  scale_colour_manual(values=c("grey20", "firebrick")) +
+  guides(colour = guide_legend(override.aes = list(size=4))) +
+  theme_void() +
+  theme(legend.title=element_blank(),
+        legend.text = element_text(size=12))
+cancer_plot
+```
+
+```{r}
+ggsave(cancer_plot, filename="cook_tgfbri_umap.pdf", 
+       width=4, height=3.25)
+```
+
+## Correlation heatmap
+```{r}
+meta_list <- readRDS("../../output/master_metadata_cook_kinase.rds")
+```
+
+```{r}
+emt_names <- c("CancerSEA", "Hallmark", "GO", 
+                     "Cook", "dbEMT", "Puram_pEMT", "Taube",
+                     "Kinker_I", "Kinker_II", "Kinker_III", "EMP_Sig")
+```
+
+```{r}
+getCor <- function(df){
+  total_arch <- unique(paste0("A", unique(df$Archetype_Membership)))
+  total_arch <- total_arch[order(total_arch)]
+  cor_mat <- cor(df[,total_arch], df[,emt_names])
+}
+
+cor_list <- lapply(meta_list, getCor)
+```
+
+```{r}
+library(ComplexHeatmap)
+cell_lines <- names(meta_list)
+heat_list <- NULL
+for(i in 1:length(cell_lines)){
+  heat <- ComplexHeatmap::pheatmap(t(cor_list[[cell_lines[i]]])[gene_set_order,],
+                                   breaks=seq(-0.5,0.5, length.out=100),
+                                   color = colorRampPalette(rev(RColorBrewer::brewer.pal(7, "RdBu")))(100),
+                                  cluster_rows=F,
+                                  cluster_cols=T,
+                                  clustering_method="ward.D2",
+                                  treeheight_col = 0,
+                                  fontsize = 10,
+                                  legend = F,
+                                  border_col="black")
+    heat_list <- heat_list + heat
+}
+draw(heat_list)
+```
+
+```{r}
+pdf(file = "Cook_Archetype_EMT_correlation.pdf",
+    width=5.25, height=2.15)
+draw(heat_list)
+dev.off()
+```

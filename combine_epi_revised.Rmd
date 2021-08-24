@@ -1,0 +1,500 @@
+---
+title: "Combine epithelial cells"
+output: html_notebook
+---
+
+# Dependencies
+
+```{r}
+library(Seurat)
+library(Matrix)
+library(tidyverse)
+library(ggrastr)
+```
+# General functions
+Sometimes you get stray cells annotated as "epithelial", but reside in a cluster that is very clearly some other cell type (eg. T cell). This may cause some weird results when we subset in on cells from individual patients. **These are the vast minority**. To clean this issue up, we'll only consider cells 
+1) Annotated as "Epithelial_cells" from singleR
+2i) Reside in a cluster that contains >1% of all epithelial cells (eg. if 5/2000 of all epithelial cells in a specific cluster, we remove them)
+2ii) Reside in a cluster where "Epithelial" is the most abundant annotation (in case there's a tiny cluster that isn't >1%, but is dominantly epithelial)
+
+Filter on (1) and (2i OR 2ii)
+
+```{r}
+# 2i) Which clusters have >1% of all the epithelial cells
+getHighFreqClusters <- function(seurat){
+  epi_counts_threshold <- seurat@meta.data %>% 
+    filter(CellType == "Epithelial_cells") %>% 
+    group_by(seurat_clusters) %>%
+    summarise(count = n()) %>%
+    mutate(prop = count / sum(count)) %>%
+    filter(prop >= 0.01) %>%
+    pull(seurat_clusters) %>%
+    as.character()
+}
+```
+
+```{r}
+# 2iI) Which clusters are dominantly epithelial
+getDominantClusters <- function(seurat){
+  epi_clusters <- seurat@meta.data %>% group_by(seurat_clusters, CellType) %>%
+    summarise(count = n()) %>%
+    mutate(prop = count / sum(count)) %>%
+    top_n(1, prop) %>%
+    filter(CellType == "Epithelial_cells") %>%
+    pull(seurat_clusters) %>%
+    as.character()
+}
+
+```
+
+```{r}
+getEpithelial <- function(seurat){
+  high_freq_clusters <- getHighFreqClusters(seurat)
+  epi_dominant_clusters <- getDominantClusters(seurat)
+  
+  epi_meta <- seurat@meta.data %>%
+    filter(CellType == "Epithelial_cells") %>%
+    filter(seurat_clusters %in% high_freq_clusters |
+             seurat_clusters %in% epi_dominant_clusters)
+  
+  ###Summary of filter
+  raw_epi <- seurat@meta.data %>% filter(CellType == "Epithelial_cells") %>% nrow()
+  filtered_epi <- nrow(epi_meta)
+  print(paste0(filtered_epi, "/", raw_epi, " Epithelial cells kept"))
+  
+  DefaultAssay(seurat) <- "RNA"
+  seurat <- subset(DietSeurat(seurat), cells = rownames(epi_meta))
+  return(seurat)
+}
+```
+
+
+# Colorectal - Lee et al - GSE144735 (SMC)
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Lee"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+colorectal_lee <- getEpithelial(seurat)
+```
+
+# Colorectal - Lee et al - GSE132465 (KUL)
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_lee_KUL_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Lee"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+colorectal_lee_kul <- getEpithelial(seurat)
+```
+
+# Colorectal - Uhlitz et al - Data direct from authors (preprint)
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Uhlitz_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Uhlitz"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+colorectal_uhlitz <- getEpithelial(seurat)
+```
+
+```{r}
+colorectal_uhlitz$Patient <- colorectal_uhlitz$orig.ident
+```
+
+
+# Colorectal - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/colorectal_Qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Colorectal"
+seurat$Source <- "Qian"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+colorectal_qian <- getEpithelial(seurat)
+```
+
+```{r}
+colorectal_qian$Patient <- colorectal_qian$orig.ident
+```
+
+# Gastric - Sathe et al - https://dna-discovery.stanford.edu
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/gastric_sathe_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Gastric"
+seurat$Source <- "Sathe"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+gastric_sathe <- getEpithelial(seurat)
+```
+
+```{r}
+gastric_sathe$Patient <- gastric_sathe$orig.ident
+```
+
+# Lung - Kim et al - GSE131907
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_kim_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Kim"
+seurat$Patient <- seurat$Sample
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+lung_kim <- getEpithelial(seurat)
+```
+
+```{r}
+lung_kim$Patient <- lung_kim$Sample
+```
+
+# Lung - Lambrechts et al - E-MTAB-6149 & E-MTAB-6653
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_lambrechts_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Lambrechts"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+lung_lambrechts <- getEpithelial(seurat)
+```
+
+```{r}
+lung_lambrechts$Patient <- lung_lambrechts$orig.ident
+```
+
+# Lung - Laughey et al - GSE123904
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_laughney_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Laughney"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+lung_laughney <- getEpithelial(seurat)
+```
+
+
+# Lung - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Qian"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+lung_qian <- getEpithelial(seurat)
+```
+
+# Lung - Wu et al - GSE148071
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/lung_wu_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Lung"
+seurat$Source <- "Wu"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+lung_wu <- getEpithelial(seurat)
+```
+
+```{r}
+lung_wu$Patient <- lung_wu$orig.ident
+```
+
+# Ovarian - Geistlinger et al - GSE154600
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_geistlinger_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Ovarian"
+seurat$Source <- "Geistlinger"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+ovarian_geistlinger <- getEpithelial(seurat)
+```
+
+```{r}
+ovarian_geistlinger$Patient <- ovarian_geistlinger$orig.ident
+```
+
+# Ovarian - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/ovarian_qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Ovarian"
+seurat$Source <- "Qian"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+ovarian_qian <- getEpithelial(seurat)
+```
+
+
+# PDAC - Steele et al - GSE155698
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/pdac_steele_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "PDAC"
+seurat$Source <- "Steele"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+pdac_steele <- getEpithelial(seurat)
+```
+
+```{r}
+pdac_steele$Patient <- gsub("PDAC_", "", pdac_steele$Sample)
+```
+
+# Breast - Wu et al - ENA PRJEB35405
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_wu_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Wu"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+breast_wu <- getEpithelial(seurat)
+```
+
+# Breast - Qian et al - http://blueprint.lambrechtslab.org
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_qian_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Qian"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+breast_qian <- getEpithelial(seurat)
+```
+
+
+
+# Breast - Bassez et al - http://biokey.lambrechtslab.org/
+
+## Cohort 1
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort1_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Bassez"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+breast_bassez_cohort1 <- getEpithelial(seurat)
+```
+
+## Cohort 2
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/breast_bassez_cohort2_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "Breast"
+seurat$Source <- "Bassez"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+breast_bassez_cohort2 <- getEpithelial(seurat)
+```
+
+# SCC - Ji et al - GSE144236
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/scc_ji_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "SCC"
+seurat$Source <- "Ji"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+scc_ji <- getEpithelial(seurat)
+```
+
+# Nasopharyngeal Carcinoma - Chen et al - GSE150430
+
+```{r}
+seurat <- readRDS("../output/tumour_annotations/npc_chen_seurat.rds")
+#Add some metadata to help post-merge
+seurat$Cancer <-  "NPC"
+seurat$Source <- "Chen"
+```
+
+```{r}
+DimPlot(seurat, group.by="CellType", label=T)
+DimPlot(seurat, group.by="seurat_clusters", label=T)
+```
+
+```{r}
+npc_chen <- getEpithelial(seurat)
+```
+
+
+# Combine all
+```{r}
+seurat <- merge(colorectal_lee, list(colorectal_lee_kul, colorectal_uhlitz,
+                              colorectal_qian, gastric_sathe, lung_kim, lung_lambrechts,
+                              lung_laughney, lung_qian, lung_wu, ovarian_geistlinger,
+                              ovarian_qian, pdac_steele, breast_wu, breast_qian,
+                              breast_bassez_cohort1, breast_bassez_cohort2, scc_ji,
+                              npc_chen),
+                merge.data=F)
+seurat$SampleID <- paste(seurat$Cancer, seurat$Source, seurat$Patient, sep="_")
+
+
+rm(colorectal_lee, colorectal_lee_kul, colorectal_uhlitz,
+                              colorectal_qian, gastric_sathe, lung_kim, lung_lambrechts,
+                              lung_laughney, lung_qian, lung_wu, ovarian_geistlinger,
+                              ovarian_qian, pdac_steele, breast_wu, breast_qian,
+                              breast_bassez_cohort1, breast_bassez_cohort2, scc_ji,
+                              npc_chen)
+
+
+samples_keep <- names(table(seurat$SampleID)[which(table(seurat$SampleID) > 100)])
+
+print(paste0("Keeping ", length(samples_keep), "/", length(unique(seurat$SampleID)), " samples"))
+
+seurat <- subset(seurat, subset = SampleID %in% samples_keep)
+
+
+seurat <- NormalizeData(seurat)
+seurat <- FindVariableFeatures(seurat)
+seurat <- ScaleData(seurat, vars.to.regress=c("S.Score", "G2M.Score", "percent.mito",
+                                              "nCount_RNA"))
+seurat <- RunPCA(seurat, verbose=F)
+seurat <- RunUMAP(seurat, dims=1:30)
+
+saveRDS(seurat, file="../output/combined_epi_revised.rds")
+```
+
+```{r}
+DimPlot(seurat, group.by="Cancer", pt.size=0.1)
+```
+
+
+
+
+
+
+
+
